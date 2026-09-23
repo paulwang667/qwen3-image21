@@ -123,7 +123,12 @@ fn encode_prompt(
     Ok(prompt_emb)
 }
 
-/// Save image tensor [-1,1] to PNG file.
+/// Save image tensor [-1,1] to PNG file. The VAE decoder outputs 4 channels
+/// (RGBA, per the real checkpoint's `conv_out` weight shape `[4, 144, 3, 3]`),
+/// so the alpha channel must be dropped before handing bytes to an Rgb image
+/// buffer — `ImageBuffer::from_vec` only checks the buffer is at least
+/// width*height*3 bytes, not exactly, so an un-dropped 4th channel is silently
+/// accepted and misread at the wrong stride, producing a periodic stripe artifact.
 fn save_image(image: &Tensor, width: usize, height: usize, output: &str) -> Result<()> {
     let image = image.clamp(-1.0, 1.0)?;
     let image = image.affine(0.5, 0.5)?;   // (x + 1) * 0.5
@@ -132,13 +137,12 @@ fn save_image(image: &Tensor, width: usize, height: usize, output: &str) -> Resu
     let image = image.i(0)?;               // [C, H, W]
     let image = image.permute((1, 2, 0))?; // [H, W, C]
 
+    let channels = image.dim(2)?;
+    let pixels = image.flatten_all()?.to_vec1::<u8>().unwrap();
+    let rgb: Vec<u8> = pixels.chunks(channels).flat_map(|px| [px[0], px[1], px[2]]).collect();
+
     let img: image::ImageBuffer<image::Rgb<u8>, Vec<u8>> =
-        image::ImageBuffer::from_vec(
-            width as u32,
-            height as u32,
-            image.flatten_all()?.to_vec1::<u8>().unwrap(),
-        )
-        .unwrap();
+        image::ImageBuffer::from_vec(width as u32, height as u32, rgb).unwrap();
     img.save(output)?;
     println!("Image saved to: {}", output);
     Ok(())

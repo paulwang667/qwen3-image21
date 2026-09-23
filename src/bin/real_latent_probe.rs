@@ -33,13 +33,21 @@ fn mean_pairwise_cosine(x: &Tensor, max_pairs: usize) -> Result<f64> {
 }
 
 fn main() -> Result<()> {
-    let device = Device::Cpu;
     let latents_path = std::env::args().nth(1).unwrap_or_else(|| "/root/real_latents.safetensors".to_string());
     let vae_path = std::env::args()
         .nth(2)
         .unwrap_or_else(|| "models/Qwen-Image-2.1-official/vae/diffusion_pytorch_model.safetensors".to_string());
     let height: usize = std::env::args().nth(3).and_then(|s| s.parse().ok()).unwrap_or(256);
     let width: usize = std::env::args().nth(4).and_then(|s| s.parse().ok()).unwrap_or(256);
+    // Device selection to A/B test whether a backend-specific kernel bug (not the
+    // VAE architecture itself) is responsible for artifacts seen in real pipeline
+    // runs: pass "cuda" or "metal" as the 5th arg to match main.rs's device choice.
+    let device = match std::env::args().nth(5).as_deref() {
+        Some("cuda") => Device::cuda_if_available(0)?,
+        Some("metal") => Device::metal_if_available(0)?,
+        _ => Device::Cpu,
+    };
+    println!("Using device: {device:?}");
 
     let tensors = candle_core::safetensors::load(&latents_path, &device)?;
     let packed_latents = tensors.get("packed_latents").expect("missing packed_latents key").clone();
