@@ -67,8 +67,13 @@ struct RmsNormChannelFirst {
 }
 
 impl RmsNormChannelFirst {
-    fn new(dim: usize, vb: VarBuilder) -> Result<Self> {
-        let gamma = vb.get(dim, "gamma")?;
+    /// `trailing_ones` matches the source's `images` flag: 3 (`[dim,1,1,1]`) for
+    /// `images=False` (every ResidualBlock norm, `decoder.head.0`), 2 (`[dim,1,1]`)
+    /// for `images=True` (the AttentionBlock norm) — both have exactly `dim` elements.
+    fn new(dim: usize, trailing_ones: usize, vb: VarBuilder) -> Result<Self> {
+        let mut shape = vec![dim];
+        shape.extend(std::iter::repeat(1).take(trailing_ones));
+        let gamma = vb.get(shape, "gamma")?.reshape(dim)?;
         Ok(Self { gamma, dim })
     }
 
@@ -83,8 +88,27 @@ impl RmsNormChannelFirst {
     }
 }
 
+/// Load a 2D conv whose weight this checkpoint stores as a genuine 5D Conv3d
+/// tensor `[out, in, 1, kh, kw]` (every `QwenImage21CausalConv3d` here, even
+/// pointwise ones) — squeeze away the trivial temporal kernel dim of 1 so it
+/// can be used as an ordinary `Conv2d`.
+fn conv2d_3d_weight(
+    in_c: usize,
+    out_c: usize,
+    k: usize,
+    padding: usize,
+    vb: VarBuilder,
+) -> Result<candle_nn::Conv2d> {
+    let ws = vb.get((out_c, in_c, 1, k, k), "weight")?.squeeze(2)?;
+    let bs = vb.get(out_c, "bias")?;
+    Ok(candle_nn::Conv2d::new(ws, Some(bs), Conv2dConfig { padding, ..Default::default() }))
+}
+
 /// Residual block: norm1 -> silu -> conv1 -> norm2 -> silu -> conv2, plus a
-/// 1x1 shortcut conv when channel count changes. Matches `QwenImage21ResidualBlock`.
+/// 1x1 shortcut conv when channel count changes. Matches `QwenImage21ResidualBlock`,
+/// whose weights this checkpoint stores as an indexed `nn.Sequential` (`residual.0`
+/// = norm1, `.2` = conv1, `.3` = norm2, `.6` = conv2 — `.1`/`.4`/`.5` are the
+/// parameter-free SiLU/SiLU/Dropout in between) plus a sibling `shortcut` conv.
 #[derive(Debug, Clone)]
 struct ResidualBlock {
     norm1: RmsNormChannelFirst,
@@ -96,20 +120,12 @@ struct ResidualBlock {
 
 impl ResidualBlock {
     fn new(in_dim: usize, out_dim: usize, vb: VarBuilder) -> Result<Self> {
-        let norm1 = RmsNormChannelFirst::new(in_dim, vb.pp("norm1"))?;
-        let conv1 = candle_nn::conv2d(
-            in_dim, out_dim, 3,
-            Conv2dConfig { padding: 1, ..Default::default() },
-            vb.pp("conv1"),
-        )?;
-        let norm2 = RmsNormChannelFirst::new(out_dim, vb.pp("norm2"))?;
-        let conv2 = candle_nn::conv2d(
-            out_dim, out_dim, 3,
-            Conv2dConfig { padding: 1, ..Default::default() },
-            vb.pp("conv2"),
-        )?;
+        let norm1 = RmsNormChannelFirst::new(in_dim, 3, vb.pp("residual.0"))?;
+        let conv1 = conv2d_3d_weight(in_dim, out_dim, 3, 1, vb.pp("residual.2"))?;
+        let norm2 = RmsNormChannelFirst::new(out_dim, 3, vb.pp("residual.3"))?;
+        let conv2 = conv2d_3d_weight(out_dim, out_dim, 3, 1, vb.pp("residual.6"))?;
         let conv_shortcut = if in_dim != out_dim {
-            Some(candle_nn::conv2d(in_dim, out_dim, 1, Default::default(), vb.pp("conv_shortcut"))?)
+            Some(conv2d_3d_weight(in_dim, out_dim, 1, 0, vb.pp("shortcut"))?)
         } else {
             None
         };
@@ -142,7 +158,7 @@ struct AttentionBlock {
 
 impl AttentionBlock {
     fn new(dim: usize, vb: VarBuilder) -> Result<Self> {
-        let norm = RmsNormChannelFirst::new(dim, vb.pp("norm"))?;
+        let norm = RmsNormChannelFirst::new(dim, 2, vb.pp("norm"))?;
         let to_qkv = candle_nn::conv2d(dim, dim * 3, 1, Default::default(), vb.pp("to_qkv"))?;
         let proj = candle_nn::conv2d(dim, dim, 1, Default::default(), vb.pp("proj"))?;
         Ok(Self { norm, to_qkv, proj })
@@ -179,9 +195,9 @@ struct MidBlock {
 
 impl MidBlock {
     fn new(dim: usize, vb: VarBuilder) -> Result<Self> {
-        let resnet0 = ResidualBlock::new(dim, dim, vb.pp("resnets.0"))?;
-        let attn = AttentionBlock::new(dim, vb.pp("attentions.0"))?;
-        let resnet1 = ResidualBlock::new(dim, dim, vb.pp("resnets.1"))?;
+        let resnet0 = ResidualBlock::new(dim, dim, vb.pp("0"))?;
+        let attn = AttentionBlock::new(dim, vb.pp("1"))?;
+        let resnet1 = ResidualBlock::new(dim, dim, vb.pp("2"))?;
         Ok(Self { resnet0, attn, resnet1 })
     }
 
@@ -240,15 +256,17 @@ impl UpBlock {
         let mut resnets = Vec::with_capacity(num_res_blocks + 1);
         let mut current = in_dim;
         for i in 0..=num_res_blocks {
-            resnets.push(ResidualBlock::new(current, out_dim, vb.pp(format!("resnets.{}", i)))?);
+            resnets.push(ResidualBlock::new(current, out_dim, vb.pp(format!("{}", i)))?);
             current = out_dim;
         }
 
         let (upsampler, avg_shortcut_factor_t) = if up_flag {
+            // The resample conv (`upsamples.<i>.upsamples.<num_res_blocks+1>.resample.1`)
+            // is a genuine 2D conv (4D weight), unlike the CausalConv3d-backed resnets above.
             let conv = candle_nn::conv2d(
                 out_dim, out_dim, 3,
                 Conv2dConfig { padding: 1, ..Default::default() },
-                vb.pp("upsampler.resample.1"),
+                vb.pp(format!("{}.resample.1", num_res_blocks + 1)),
             )?;
             let factor_t = if temporal_upsample { 2 } else { 1 };
             (Some(conv), Some(factor_t))
@@ -301,13 +319,12 @@ impl VaeDecoder {
         mults.extend(rev);
         let dims: Vec<usize> = mults.iter().map(|&m| dim * m).collect();
 
-        let post_quant_conv = candle_nn::conv2d(cfg.z_dim, cfg.z_dim, 1, Default::default(), vb.pp("post_quant_conv"))?;
-        let conv_in = candle_nn::conv2d(
-            cfg.z_dim, dims[0], 3,
-            Conv2dConfig { padding: 1, ..Default::default() },
-            vb.pp("decoder.conv_in"),
-        )?;
-        let mid_block = MidBlock::new(dims[0], vb.pp("decoder.mid_block"))?;
+        // This checkpoint uses the native (pre-diffusers-port) naming: `conv2` is
+        // post_quant_conv (`conv1` is the encoder's quant_conv, unused here), and
+        // every conv is stored with a genuine 5D Conv3d weight shape.
+        let post_quant_conv = conv2d_3d_weight(cfg.z_dim, cfg.z_dim, 1, 0, vb.pp("conv2"))?;
+        let conv_in = conv2d_3d_weight(cfg.z_dim, dims[0], 3, 1, vb.pp("decoder.conv1"))?;
+        let mid_block = MidBlock::new(dims[0], vb.pp("decoder.middle"))?;
 
         let mut temporal_upsample = cfg.temperal_downsample.clone();
         temporal_upsample.reverse();
@@ -319,18 +336,15 @@ impl VaeDecoder {
             let temporal = up_flag && temporal_upsample.get(i).copied().unwrap_or(false);
             let block = UpBlock::new(
                 dims[i], dims[i + 1], cfg.num_res_blocks, up_flag, temporal,
-                vb.pp(format!("decoder.up_blocks.{}", i)),
+                vb.pp(format!("decoder.upsamples.{}.upsamples", i)),
             )?;
             up_blocks.push(block);
         }
 
+        // `head` is a 3-element Sequential: [0]=norm (RMSNorm), [1]=SiLU (no params), [2]=conv_out.
         let out_dim = *dims.last().unwrap();
-        let norm_out = RmsNormChannelFirst::new(out_dim, vb.pp("decoder.norm_out"))?;
-        let conv_out = candle_nn::conv2d(
-            out_dim, cfg.out_channels, 3,
-            Conv2dConfig { padding: 1, ..Default::default() },
-            vb.pp("decoder.conv_out"),
-        )?;
+        let norm_out = RmsNormChannelFirst::new(out_dim, 3, vb.pp("decoder.head.0"))?;
+        let conv_out = conv2d_3d_weight(out_dim, cfg.out_channels, 3, 1, vb.pp("decoder.head.2"))?;
 
         Ok(Self { post_quant_conv, conv_in, mid_block, up_blocks, norm_out, conv_out })
     }
@@ -350,54 +364,31 @@ impl VaeDecoder {
     }
 }
 
-/// Unpack latents back to image format.
+/// Unpack a transformer token sequence `[B, H*W, C]` back into `[B, C, 1, H, W]`.
+/// Qwen-Image-2.1's transformer uses `patch_size=1` (each latent pixel is its own
+/// token, `in_channels`/`out_channels` == the VAE's `z_dim` directly) — unlike
+/// Flux/SD3-style models that pack 2x2 spatial patches into 4x the channel count.
 pub fn unpack_latents(
     latents: &Tensor,
     height: usize,
     width: usize,
     vae_scale_factor: usize,
 ) -> Result<Tensor> {
-    let (b, _num_patches, channels_packed) = latents.dims3()?;
-    let channels = channels_packed / 4;
-    let patch_size = 2;
+    let (b, _num_tokens, c) = latents.dims3()?;
+    let h = height / vae_scale_factor;
+    let w = width / vae_scale_factor;
 
-    let h = 2 * (height / (vae_scale_factor * 2));
-    let w = 2 * (width / (vae_scale_factor * 2));
-
-    let x = latents.reshape((b, h / 2, w / 2, channels, patch_size, patch_size))?;
-    let x = x.permute((0, 3, 1, 4, 2, 5))?;
-    let x = x.reshape((b, channels, 1, h, w))?;
-
-    Ok(x)
+    let x = latents.transpose(1, 2)?.contiguous()?; // [B, C, H*W]
+    let x = x.reshape((b, c, h, w))?;
+    x.unsqueeze(2) // [B, C, 1, H, W]
 }
 
-/// Pack latents for transformer input.
+/// Flatten latents `[B, C, 1, H, W]` into a transformer token sequence `[B, H*W, C]`.
 pub fn pack_latents(latents: &Tensor) -> Result<Tensor> {
-    let (_b, _c, _t, h, w) = latents.dims5()?;
-    let p = 2;
-
-    let x = latents.squeeze(2)?;
-
-    let pad_h = (p - h % p) % p;
-    let pad_w = (p - w % p) % p;
-    let x = if pad_h > 0 {
-        x.pad_with_zeros(D::Minus2, 0, pad_h)?
-    } else {
-        x
-    };
-    let x = if pad_w > 0 {
-        x.pad_with_zeros(D::Minus1, 0, pad_w)?
-    } else {
-        x
-    };
-
-    let (b, c, h_pad, w_pad) = x.dims4()?;
-    let h_patches = h_pad / p;
-    let w_patches = w_pad / p;
-
-    let x = x.reshape((b, c, h_patches, 2, w_patches, 2))?;
-    let x = x.permute((0, 3, 4, 5, 1, 2))?;
-    x.reshape((b, h_patches * w_patches, c * 4))
+    let (b, c, _t, h, w) = latents.dims5()?;
+    let x = latents.squeeze(2)?; // [B, C, H, W]
+    let x = x.reshape((b, c, h * w))?;
+    x.transpose(1, 2)?.contiguous() // [B, H*W, C]
 }
 
 /// Normalize latents using mean and std.

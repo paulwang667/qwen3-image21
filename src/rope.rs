@@ -43,8 +43,7 @@ impl EmbedNd {
         let neg_index = Tensor::arange(1, 1025, device)?
             .to_dtype(DType::F32)?
             .flip(&[0])?
-            .mul(&Tensor::new(-1.0f32, device)?)?
-            .sub(&Tensor::new(1.0f32, device)?)?; // -1024, -1023, ..., -1
+            .affine(-1.0, -1.0)?; // -1024, -1023, ..., -1
 
         let mut freqs = Vec::with_capacity(3);
         let mut angles = Vec::with_capacity(3);
@@ -53,10 +52,9 @@ impl EmbedNd {
             let half = dim / 2;
             let pow = Tensor::arange(0, half as i64, device)?
                 .to_dtype(DType::F32)?
-                .div(&Tensor::new(dim as f32, device)?)?
-                .mul(&Tensor::new(-1.0f32, device)?)?
+                .affine(-1.0 / dim as f64, 0.0)?
                 .exp()?; // theta^(-2i/dim)
-            let inv_freq = pow.mul(&Tensor::new(1.0 / theta, device)?)?; // 1/theta^(2i/dim)
+            let inv_freq = pow.affine(1.0 / theta as f64, 0.0)?; // 1/theta^(2i/dim)
 
             // pos_freqs = outer(pos_index, inv_freq)
             let pos_outer = pos_index.unsqueeze(1)?.matmul(&inv_freq.unsqueeze(0)?)?; // [8192, half]
@@ -172,10 +170,14 @@ impl EmbedNd {
             }
         }
 
-        // Convert to tensors
-        let frame_idx = Tensor::new(frame_index.as_slice(), &self.freqs[0].device())?;
-        let height_idx = Tensor::new(height_index.as_slice(), &self.freqs[0].device())?;
-        let width_idx = Tensor::new(width_index.as_slice(), &self.freqs[0].device())?;
+        // Convert to tensors. Table layout is [neg(-1024..-1), pos(0..8191)], so raw
+        // position `p` lives at table index `p + 1024` (e.g. p=-8, from the image
+        // grid centered on zero, maps to index 1016, not to a negative/wrapped index).
+        const TABLE_OFFSET: i64 = 1024;
+        let to_index = |v: &[i64]| -> Vec<i64> { v.iter().map(|&p| p + TABLE_OFFSET).collect() };
+        let frame_idx = Tensor::new(to_index(&frame_index).as_slice(), &self.freqs[0].device())?;
+        let height_idx = Tensor::new(to_index(&height_index).as_slice(), &self.freqs[0].device())?;
+        let width_idx = Tensor::new(to_index(&width_index).as_slice(), &self.freqs[0].device())?;
 
         // Gather frequencies for each axis based on mode
         let (frame_freq, height_freq, width_freq) = if self.mode == RopeMode::Complex {
@@ -202,9 +204,9 @@ impl EmbedNd {
         // where complex is stored as interleaved [real0, imag0, real1, imag1, ...]
         let cat_freq = Tensor::cat(&[&frame_freq, &height_freq, &width_freq], 1)?; // [seq_len, sum(half), 2]
 
-        // Flatten last dim: [seq_len, sum(half)*2]
-        let (s, h2) = cat_freq.dims2()?;
-        Ok(cat_freq.reshape((s, h2))?)
+        // Flatten last dim: [seq_len, sum(half), 2] -> [seq_len, sum(half)*2]
+        let (s, half_sum, two) = cat_freq.dims3()?;
+        Ok(cat_freq.reshape((s, half_sum * two))?)
     }
 }
 

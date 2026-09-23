@@ -121,8 +121,8 @@ impl Attention {
         eprintln!("  [Attention] after matmul attn_weights.shape={:?}", attn_weights.shape());
         // Apply attention mask: convert bool mask (True=attend) to additive (0/-inf)
         if let Some(mask) = attention_mask {
-            let neg_inf = Tensor::new(f32::NEG_INFINITY, attn_weights.device())?;
-            let zero = Tensor::new(0.0f32, attn_weights.device())?;
+            let neg_inf = Tensor::new(f32::NEG_INFINITY, attn_weights.device())?.broadcast_as(mask.dims())?.contiguous()?;
+            let zero = Tensor::new(0.0f32, attn_weights.device())?.broadcast_as(mask.dims())?.contiguous()?;
             let additive_mask = mask.where_cond(&zero, &neg_inf)?;
             attn_weights = attn_weights.broadcast_add(&additive_mask)?;
         }
@@ -186,8 +186,8 @@ impl Attention {
 
         // Apply attention mask: convert bool mask (True=attend) to additive (0/-inf)
         if let Some(mask) = attention_mask {
-            let neg_inf = Tensor::new(f32::NEG_INFINITY, attn_weights.device())?;
-            let zero = Tensor::new(0.0f32, attn_weights.device())?;
+            let neg_inf = Tensor::new(f32::NEG_INFINITY, attn_weights.device())?.broadcast_as(mask.dims())?.contiguous()?;
+            let zero = Tensor::new(0.0f32, attn_weights.device())?.broadcast_as(mask.dims())?.contiguous()?;
             let additive_mask = mask.where_cond(&zero, &neg_inf)?;
             attn_weights = attn_weights.broadcast_add(&additive_mask)?;
         }
@@ -472,10 +472,10 @@ impl QwenImageTransformerQuantized {
             .to_dtype(candle_core::DType::U8)?;
         // img_shapes: (frame, height_patches, width_patches) for image blocks
         // VAE scale factor is 16 (AutoencoderKLQwenImage21), patch size is 2
+        // patch_size=1: each latent pixel is its own token, no 2x2 packing
         let vae_scale_factor = 16;
-        let patch_size = 2;
-        let h_patches = height / (vae_scale_factor * patch_size);
-        let w_patches = width / (vae_scale_factor * patch_size);
+        let h_patches = height / vae_scale_factor;
+        let w_patches = width / vae_scale_factor;
         let img_shapes = [(1, h_patches, w_patches)];
         let pe = EmbedNd::new(self.cfg.hidden_size(), self.cfg.rope_theta, self.cfg.axes_dims_rope, &self.device)?
             .forward(&img_shapes, &image_pad_mask, &self.device)?;
@@ -572,10 +572,10 @@ impl QwenImageTransformerQuantized {
             .to_dtype(candle_core::DType::U8)?;
         // img_shapes: (frame, height_patches, width_patches) for image blocks
         // VAE scale factor is 16 (AutoencoderKLQwenImage21), patch size is 2
+        // patch_size=1: each latent pixel is its own token, no 2x2 packing
         let vae_scale_factor = 16;
-        let patch_size = 2;
-        let h_patches = height / (vae_scale_factor * patch_size);
-        let w_patches = width / (vae_scale_factor * patch_size);
+        let h_patches = height / vae_scale_factor;
+        let w_patches = width / vae_scale_factor;
         let img_shapes = [(1, h_patches, w_patches)];
         let pe = EmbedNd::new(self.cfg.hidden_size(), self.cfg.rope_theta, self.cfg.axes_dims_rope, &self.device)?
             .forward(&img_shapes, &image_pad_mask, &self.device)?;

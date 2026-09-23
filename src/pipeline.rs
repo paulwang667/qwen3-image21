@@ -63,8 +63,8 @@ pub fn denoise(
     let batch_size = prompt_emb.dim(0)?;
     let num_channels_latents = cfg.vae_cfg.z_dim;
     let vae_scale_factor = cfg.vae_cfg.spatial_compression_ratio();
-    let latent_h = 2 * (height / (vae_scale_factor * 2));
-    let latent_w = 2 * (width / (vae_scale_factor * 2));
+    let latent_h = height / vae_scale_factor;
+    let latent_w = width / vae_scale_factor;
 
     // Prepare random latents: [B, C, T, H, W] (temporal at index 2)
     let shape = (batch_size, num_channels_latents, 1, latent_h, latent_w);
@@ -81,8 +81,8 @@ pub fn denoise(
         .collect();
 
     // Prepare RoPE position IDs
-    let h_patches = height / (vae_scale_factor * 2);
-    let w_patches = width / (vae_scale_factor * 2);
+    let h_patches = height / vae_scale_factor;
+    let w_patches = width / vae_scale_factor;
     let img_ids = crate::rope::compute_img_ids(1, h_patches, w_patches, &cfg.device)?;
     let txt_ids = crate::rope::compute_txt_ids(1, prompt_emb.dim(1)?, 0, &cfg.device)?;
 
@@ -94,9 +94,10 @@ pub fn denoise(
     // Denoising loop
     for i in 0..num_inference_steps {
         let t = timesteps[i] as f64;
+        // [B] (batch=1); `timestep_embedding` does its own unsqueeze to broadcast
+        // against the exponent table, so this must stay 1-D here.
         let timestep = Tensor::new(&[t], &cfg.device)?
-            .to_dtype(packed_latents.dtype())?
-            .unsqueeze(0)?;
+            .to_dtype(packed_latents.dtype())?;
 
         // Apply timestep embedding (sinusoidal -> 256 dim)
         let timestep = crate::scheduler::timestep_embedding(&timestep, 256)?

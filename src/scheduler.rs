@@ -83,8 +83,8 @@ pub fn timestep_embedding(t: &Tensor, dim: usize) -> Result<Tensor> {
         .collect();
 
     let exp_table = Tensor::new(exponent.as_slice(), device)?;
-    // t: [B, 1] -> [B, half_dim] -- diffusers uses time_factor=1000.0
-    let emb = (t.unsqueeze(1)? * 1000.0 * exp_table)?;
+    // t: [B] -> [B, 1] -> [B, half_dim] -- diffusers uses time_factor=1000.0
+    let emb = (t.unsqueeze(1)? * 1000.0)?.broadcast_mul(&exp_table)?;
 
     // Concatenate sin and cos
     let sin = emb.sin()?;
