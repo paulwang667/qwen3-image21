@@ -237,6 +237,15 @@ fn main() -> Result<()> {
         let latents = denoise(&transformer, &prompt_emb, args.height, args.width, args.steps, &pipeline_cfg)?;
         eprintln!("  Denoising done in {:.2}s", start.elapsed().as_secs_f32());
 
+        // Debug hook: dump the real packed latents for offline VAE diagnostics
+        // (e.g. checking whether the dup_up3d checkerboard artifact appears on
+        // a genuine denoised latent, not just synthetic test tensors).
+        if let Ok(path) = std::env::var("QWEN_DUMP_LATENTS_PATH") {
+            let tensors = std::collections::HashMap::from([("packed_latents".to_string(), latents.clone())]);
+            candle_core::safetensors::save(&tensors, &path)?;
+            eprintln!("  Dumped packed_latents to {path}");
+        }
+
         // Drop transformer before loading VAE — frees ~3.8-6.8 GB.
         drop(transformer);
         eprintln!("  Transformer released.");

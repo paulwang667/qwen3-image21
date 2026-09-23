@@ -470,4 +470,54 @@ mod tests {
         let out = decoder.decode(&latents).unwrap();
         assert_eq!(out.dims(), &[1, cfg.out_channels, 3 * 16, 5 * 16]);
     }
+
+    /// Cross-checks `dup_up3d` against the literal diffusers `QwenImage21DupUp3D.forward`
+    /// formula (repeat_interleave -> 8D view -> permute(0,1,5,2,6,3,7,4) -> merge ->
+    /// keep index [factor_t-1:]), hand-traced for a small, fully deterministic case
+    /// where numpy/torch weren't available to run directly: in_channels=2,
+    /// out_channels=4, factor_t=2, factor_s=2, H=W=2. Input channel 0 is [[0,1],[2,3]],
+    /// channel 1 is [[4,5],[6,7]]. Tracing the real formula's index arithmetic by hand
+    /// shows repeats=16 puts output channels {0,1} both fed from input channel 0 and
+    /// {2,3} both fed from channel 1 — i.e. each input channel's 2x2 grid is plainly
+    /// nearest-upsampled to 4x4 and duplicated across two adjacent output channels
+    /// (see git history / PR discussion for the full derivation).
+    #[test]
+    fn test_dup_up3d_matches_hand_traced_reference() {
+        let device = Device::Cpu;
+        #[rustfmt::skip]
+        let input = Tensor::new(
+            &[
+                0.0f32, 1.0, 2.0, 3.0, // channel 0: [[0,1],[2,3]]
+                4.0, 5.0, 6.0, 7.0,    // channel 1: [[4,5],[6,7]]
+            ],
+            &device,
+        )
+        .unwrap()
+        .reshape((1, 2, 2, 2))
+        .unwrap();
+
+        let out = dup_up3d(&input, 4, 2, 2).unwrap();
+        assert_eq!(out.dims(), &[1, 4, 4, 4]);
+
+        let up = |block: &[f32; 4]| -> Vec<f32> {
+            // Plain 2x nearest upsample of a 2x2 block to 4x4, row-major.
+            let (a, b, c, d) = (block[0], block[1], block[2], block[3]);
+            vec![
+                a, a, b, b,
+                a, a, b, b,
+                c, c, d, d,
+                c, c, d, d,
+            ]
+        };
+        let expected: Vec<f32> = [
+            up(&[0.0, 1.0, 2.0, 3.0]), // out channel 0 <- input channel 0
+            up(&[0.0, 1.0, 2.0, 3.0]), // out channel 1 <- input channel 0 (duplicated)
+            up(&[4.0, 5.0, 6.0, 7.0]), // out channel 2 <- input channel 1
+            up(&[4.0, 5.0, 6.0, 7.0]), // out channel 3 <- input channel 1 (duplicated)
+        ]
+        .concat();
+
+        let got: Vec<f32> = out.flatten_all().unwrap().to_vec1().unwrap();
+        assert_eq!(got, expected);
+    }
 }
