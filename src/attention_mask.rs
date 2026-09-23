@@ -121,27 +121,6 @@ pub fn build_token_metadata(
     Ok((image_ids, target_token_mask, block_boundaries))
 }
 
-/// Select modulation rows per token based on target_token_mask.
-/// Matches diffusers `_select_modulation_rows` for the case this codebase actually
-/// exercises: single-image generation with no condition-image prefix.
-///
-/// The real function's `causal_condition` path additionally supports a `[batch+1, dim]`
-/// modulation (a trailing `t=0` row shared by text/condition-image tokens, with target-image
-/// tokens using their own sample's row) whenever a mask is given. Nothing in this codebase
-/// ever constructs that extra row — `pipeline::denoise` always produces a plain `[batch, dim]`
-/// modulation — so that split is not implemented here; every token uses the same row.
-///
-/// Args:
-///   - `modulation`: [batch, dim]
-///   - `target_token_mask`: unused placeholder for the unimplemented causal_condition split
-/// Returns: [batch, 1, 1, dim] broadcastable to hidden_states
-pub fn select_modulation_rows(
-    modulation: &Tensor,
-    _target_token_mask: Option<&Tensor>,
-) -> Result<Tensor> {
-    modulation.unsqueeze(1)?.unsqueeze(1) // [B, 1, 1, dim]
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;

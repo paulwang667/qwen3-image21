@@ -1,6 +1,6 @@
 use candle_core::{Module, Result, Tensor, D, DType, Device};
 use candle_nn::{LayerNorm, Linear, RmsNorm};
-use super::attention_mask::{build_block_causal_mask, build_token_metadata, select_modulation_rows};
+use super::attention_mask::{build_block_causal_mask, build_token_metadata};
 use super::rope::{apply_rope, EmbedNd};
 use super::scheduler::TimeEmbedding;
 
@@ -388,39 +388,31 @@ impl TransformerBlock {
         modulation: &Tensor,
         pe: &Tensor,
         attention_mask: Option<&Tensor>,
-        target_token_mask: Option<&Tensor>,
+        _target_token_mask: Option<&Tensor>,
     ) -> Result<Tensor> {
-        // modulation: [scale1, gate1, scale2, gate2] each [B, hidden]
-        // If target_token_mask provided, modulation has extra t=0 row: [B+1, 4*dim]
-        // Select rows per token
-        let modulation = if target_token_mask.is_some() {
-            select_modulation_rows(modulation, target_token_mask)?  // [B, 1, seq, 4*dim]
-        } else {
-            modulation.unsqueeze(1)?  // [B, 1, 1, 4*dim]
-        };
-        // Now modulation: [B, 1, seq, 4*dim] or [B, 1, 1, 4*dim]
-        // Squeeze the middle 1 for chunk
-        let modulation = modulation.squeeze(1)?;  // [B, seq, 4*dim] or [B, 1, 4*dim]
-
-        // Split modulation: mod1 [scale1, gate1], mod2 [scale2, gate2]
-        let mod1 = modulation.narrow(D::Minus1, 0, x.dim(2)?)?;
-        let mod2 = modulation.narrow(D::Minus1, x.dim(2)?, x.dim(2)?)?;
+        // modulation: [B, 4*hidden] -> 4 chunks of [B, hidden], each broadcast over
+        // the sequence axis via a single unsqueeze. Every token in this codebase
+        // uses the same modulation row (no condition-image/target-image split is
+        // implemented — see attention_mask.rs), matching quantized_transformer.rs's
+        // TransformerBlock::forward exactly.
+        let parts = modulation.chunk(4, D::Minus1)?;
+        let (scale1, gate1, scale2, gate2) = (&parts[0], &parts[1], &parts[2], &parts[3]);
 
         // norm1(x) * (1 + scale1), gate1
         let normed = self.norm1.forward(x)?;
-        let scale1 = mod1.narrow(D::Minus1, 0, x.dim(2)?)?.unsqueeze(1)?;  // [B, 1/seq, hidden]
-        let normed = normed.broadcast_mul(&scale1.affine(1.0, 1.0)?)?;  // norm(x) * (1 + scale1)
+        let scale1_u = scale1.unsqueeze(1)?.affine(1.0, 1.0)?;
+        let normed = normed.broadcast_mul(&scale1_u)?;
         let attn_out = self.attn.forward(&normed, pe, attention_mask)?;
-        let gate1 = mod1.narrow(D::Minus1, x.dim(2)?, x.dim(2)?)?.tanh()?.unsqueeze(1)?;
-        let x = x.broadcast_add(&gate1.broadcast_mul(&attn_out)?)?;
+        let gate1_u = gate1.tanh()?.unsqueeze(1)?;
+        let x = x.broadcast_add(&gate1_u.broadcast_mul(&attn_out)?)?;
 
         // norm2(x) * (1 + scale2), gate2
         let normed = self.norm2.forward(&x)?;
-        let scale2 = mod2.narrow(D::Minus1, 0, x.dim(2)?)?.unsqueeze(1)?;
-        let normed = normed.broadcast_mul(&scale2.affine(1.0, 1.0)?)?;
+        let scale2_u = scale2.unsqueeze(1)?.affine(1.0, 1.0)?;
+        let normed = normed.broadcast_mul(&scale2_u)?;
         let mlp_out = self.mlp.forward(&normed)?;
-        let gate2 = mod2.narrow(D::Minus1, x.dim(2)?, x.dim(2)?)?.tanh()?.unsqueeze(1)?;
-        let x = x.broadcast_add(&gate2.broadcast_mul(&mlp_out)?)?;
+        let gate2_u = gate2.tanh()?.unsqueeze(1)?;
+        let x = x.broadcast_add(&gate2_u.broadcast_mul(&mlp_out)?)?;
 
         Ok(x)
     }
@@ -432,39 +424,32 @@ impl TransformerBlock {
         modulation: &Tensor,
         pe: &Tensor,
         attention_mask: Option<&Tensor>,
-        target_token_mask: Option<&Tensor>,
+        _target_token_mask: Option<&Tensor>,
         kv_caches: &mut [KVCache],
     ) -> Result<Tensor> {
-        // modulation: [scale1, gate1, scale2, gate2] each [B, hidden]
-        // If target_token_mask provided, modulation has extra t=0 row: [B+1, 4*dim]
-        // Select rows per token
-        let modulation = if target_token_mask.is_some() {
-            select_modulation_rows(modulation, target_token_mask)?  // [B, 1, seq, 4*dim]
-        } else {
-            modulation.unsqueeze(1)?  // [B, 1, 1, 4*dim]
-        };
-        let mod1 = modulation.narrow(D::Minus1, 0, x.dim(2)?)?;
-        let mod2 = modulation.narrow(D::Minus1, x.dim(2)?, x.dim(2)?)?;
+        // See forward() above: every token uses the same modulation row.
+        let parts = modulation.chunk(4, D::Minus1)?;
+        let (scale1, gate1, scale2, gate2) = (&parts[0], &parts[1], &parts[2], &parts[3]);
 
         // norm1(x) * (1 + scale1), gate1
         let normed = self.norm1.forward(x)?;
-        let scale1 = mod1.narrow(D::Minus1, 0, x.dim(2)?)?.unsqueeze(1)?;  // [B, 1/seq, hidden]
-        let normed = normed.broadcast_mul(&scale1.affine(1.0, 1.0)?)?;  // norm(x) * (1 + scale1)
+        let scale1_u = scale1.unsqueeze(1)?.affine(1.0, 1.0)?;
+        let normed = normed.broadcast_mul(&scale1_u)?;
         let attn_out = if let Some(cache) = kv_caches.get_mut(0) {
             self.attn.forward_cached(&normed, pe, attention_mask, Some(cache))?
         } else {
             self.attn.forward_cached(&normed, pe, attention_mask, None)?
         };
-        let gate1 = mod1.narrow(D::Minus1, x.dim(2)?, x.dim(2)?)?.tanh()?.unsqueeze(1)?;
-        let x = x.broadcast_add(&gate1.broadcast_mul(&attn_out)?)?;
+        let gate1_u = gate1.tanh()?.unsqueeze(1)?;
+        let x = x.broadcast_add(&gate1_u.broadcast_mul(&attn_out)?)?;
 
         // norm2(x) * (1 + scale2), gate2
         let normed = self.norm2.forward(&x)?;
-        let scale2 = mod2.narrow(D::Minus1, 0, x.dim(2)?)?.unsqueeze(1)?;
-        let normed = normed.broadcast_mul(&scale2.affine(1.0, 1.0)?)?;
+        let scale2_u = scale2.unsqueeze(1)?.affine(1.0, 1.0)?;
+        let normed = normed.broadcast_mul(&scale2_u)?;
         let mlp_out = self.mlp.forward(&normed)?;
-        let gate2 = mod2.narrow(D::Minus1, x.dim(2)?, x.dim(2)?)?.tanh()?.unsqueeze(1)?;
-        let x = x.broadcast_add(&gate2.broadcast_mul(&mlp_out)?)?;
+        let gate2_u = gate2.tanh()?.unsqueeze(1)?;
+        let x = x.broadcast_add(&gate2_u.broadcast_mul(&mlp_out)?)?;
 
         Ok(x)
     }
