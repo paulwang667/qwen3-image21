@@ -145,10 +145,14 @@ fn save_image(image: &Tensor, width: usize, height: usize, output: &str) -> Resu
 
 fn main() -> Result<()> {
     let args = Args::parse();
-    // Cargo.toml only enables candle's "metal" feature (no "cuda"), so check for
-    // that instead of CUDA — the previous cuda_if_available() was always false
-    // here and silently ran on CPU regardless of the Metal feature being compiled in.
-    let device = Device::metal_if_available(0)?;
+    // Cargo.toml's "metal"/"cuda" features are opt-in per build (`cargo build
+    // --features metal` on macOS, `--features cuda` on Linux/NVIDIA); whichever
+    // wasn't compiled in has its is_available() check compile down to `false`,
+    // so trying both here is safe regardless of which one this binary has.
+    let device = match Device::cuda_if_available(0)? {
+        Device::Cpu => Device::metal_if_available(0)?,
+        d => d,
+    };
     let dtype = args.precision.as_dtype();
 
     eprintln!("Device: {:?}", device);

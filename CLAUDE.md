@@ -4,7 +4,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## What this is
 
-A from-scratch Rust inference engine for Qwen-Image-2.1 (text-to-image MMDiT diffusion model), built directly on `candle-core`/`candle-nn` (not `candle-transformers`' model zoo — only its `quantized_nn`/`quantized_var_builder` utilities are reused for GGUF loading). Targets Apple Silicon via the Metal backend.
+A from-scratch Rust inference engine for Qwen-Image-2.1 (text-to-image MMDiT diffusion model), built directly on `candle-core`/`candle-nn` (not `candle-transformers`' model zoo — only its `quantized_nn`/`quantized_var_builder` utilities are reused for GGUF loading). GPU support is opt-in per build via Cargo features (`metal` for Apple Silicon, `cuda` for NVIDIA/Linux — see Commands); building with neither runs on CPU. `main.rs` tries CUDA then Metal then falls back to CPU at runtime, so the same source works on either platform — just pick the matching feature flag when building.
 
 The model weights the code is written against use a **single-stream** MMDiT architecture (one sequence of concatenated text+image tokens per block, shared modulation across all blocks) — not the classic Flux-style dual-stream (separate `img_attn`/`txt_attn`) design. `list_tensors.rs` and `test_gguf.rs` at the repo root are leftover scratch probes from reverse-engineering the checkpoint's tensor names; they are **not** part of the cargo build (no `[[bin]]` entries reference them) and can be ignored or deleted.
 
@@ -12,7 +12,9 @@ The model weights the code is written against use a **single-stream** MMDiT arch
 
 ```bash
 cargo check                    # fast type-check, use this while iterating
-cargo build --release          # release build (needed for real inference speed)
+cargo build --release          # release build, CPU only (no GPU feature enabled)
+cargo build --release --features metal   # macOS
+cargo build --release --features cuda    # Linux/NVIDIA
 cargo test                     # run unit tests (gguf_mapping, attention_mask)
 cargo test test_identity_global   # run a single test by name
 
