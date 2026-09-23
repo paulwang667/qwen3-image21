@@ -1,6 +1,7 @@
 use candle_core::{Result, Tensor, Device, DType};
 use crate::transformer::QwenImageTransformer;
 use crate::quantized_transformer::QwenImageTransformerQuantized;
+use crate::scheduler::FlowMatchEuler;
 use crate::vae::{Config as VaeConfig, VaeDecoder, pack_latents, unpack_latents, normalize_latents};
 
 /// Transformer type enum for supporting both quantized and non-quantized modes.
@@ -73,13 +74,10 @@ pub fn denoise(
     let mut packed_latents = pack_latents(&latents)?.to_dtype(cfg.dtype)?;
     let prompt_emb = prompt_emb.to_dtype(cfg.dtype)?;
 
-    // Scheduler: linear sigma schedule
-    let sigmas: Vec<f32> = (0..num_inference_steps)
-        .map(|i| 1.0 - (i as f32) / (num_inference_steps as f32))
-        .collect();
-    let timesteps: Vec<f32> = (0..num_inference_steps)
-        .map(|i| sigmas[i])
-        .collect();
+    // Resolution-dependent shifted sigma schedule (see scheduler::FlowMatchEuler docs) —
+    // image_seq_len is the packed latent's token count (patch_size=1, so latent_h*latent_w).
+    let scheduler = FlowMatchEuler::new(num_inference_steps, latent_h * latent_w);
+    let timesteps = scheduler.timesteps();
 
     // Prepare RoPE position IDs
     let h_patches = height / vae_scale_factor;
@@ -114,14 +112,7 @@ pub fn denoise(
             eprintln!("  noise_pred shape: {:?}", noise_pred.shape());
         }
 
-        // Euler step: x_{t-1} = x_t + (sigma_{t+1} - sigma_t) * noise_pred
-        let dt = if i + 1 < sigmas.len() {
-            sigmas[i + 1] - sigmas[i]
-        } else {
-            -sigmas[i]
-        };
-        let dt_tensor = Tensor::new(&[dt], &cfg.device)?.to_dtype(packed_latents.dtype())?;
-        packed_latents = packed_latents.broadcast_add(&(noise_pred.broadcast_mul(&dt_tensor)?))?;
+        packed_latents = scheduler.step(&noise_pred, &packed_latents, i)?;
 
         if i % 10 == 0 {
             eprintln!("  Step {}/{}", i + 1, num_inference_steps);
