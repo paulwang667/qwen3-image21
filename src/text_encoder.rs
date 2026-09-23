@@ -1,69 +1,69 @@
-//! Text encoder module - loads and runs text encoder models
+//! Text encoder for Qwen-Image-2.1.
 //!
-//! This module provides text encoding functionality for Qwen-Image-2.1.
-//! Currently supports placeholder embeddings for testing.
+//! The real pipeline uses a hybrid Qwen3-Next-style VLM (linear-attention/Mamba2
+//! layers mixed with regular attention, plus a non-standard int8 "rotation"
+//! quantization scheme) as its text encoder — candle-transformers has no
+//! implementation of that architecture or quantization format, and building one
+//! from scratch is out of scope here (see CLAUDE.md). Instead, this loads a
+//! real, standard dense Qwen3 causal LM (`candle_transformers::models::qwen3::Model`)
+//! as a stand-in: it gives the prompt genuine, deterministic, content-dependent
+//! influence on generation, unlike the previous placeholder which just returned
+//! random noise regardless of prompt text. It will not match the real model's
+//! semantics or output quality.
+use std::path::Path;
 
-use anyhow::Result;
-use candle_core::{Device, Tensor};
+use anyhow::{anyhow, Result};
+use candle_core::{DType, Device, Tensor, D};
+use candle_nn::VarBuilder;
+use candle_transformers::models::qwen3::{Config, Model};
+use tokenizers::Tokenizer;
 
-/// Text encoder configuration
-#[derive(Debug, Clone)]
-pub struct TextEncoderConfig {
-    pub model_path: Option<String>,
-    pub max_seq_len: usize,
-    pub hidden_size: usize,
-}
-
-impl Default for TextEncoderConfig {
-    fn default() -> Self {
-        Self {
-            model_path: None,
-            max_seq_len: 256,
-            hidden_size: 3584,
-        }
-    }
-}
-
-/// Text encoder wrapper
-#[derive(Debug, Clone)]
 pub struct TextEncoder {
-    pub config: TextEncoderConfig,
-    pub device: Device,
+    model: Model,
+    tokenizer: Tokenizer,
+    device: Device,
+    /// Number of times to tile the stand-in model's hidden states to reach
+    /// the transformer's `joint_attention_dim` (e.g. 4x for 1024 -> 4096).
+    tile_factor: usize,
 }
 
 impl TextEncoder {
-    /// Create a new text encoder
-    pub fn new(config: TextEncoderConfig, device: Device) -> Result<Self> {
-        Ok(Self {
-            config,
-            device,
-        })
-    }
-
-    /// Encode a prompt into embeddings
-    /// 
-    /// Returns a tensor of shape (batch_size, seq_len, hidden_size)
-    pub fn encode(&self, prompt: &str, _batch_size: usize) -> Result<Tensor> {
-        if let Some(model_path) = &self.config.model_path {
-            // Load actual text encoder model
-            self.encode_with_model(prompt, model_path)
-        } else {
-            // Generate placeholder embeddings for testing
-            eprintln!("Warning: Using placeholder embeddings (no text encoder model loaded)");
-            let seq_len = self.config.max_seq_len;
-            let hidden_size = self.config.hidden_size;
-            Ok(Tensor::randn(0.0f64, 1.0f64, (_batch_size, seq_len, hidden_size), &self.device)?)
+    /// Loads `config.json`, `model.safetensors`, and `tokenizer.json` from
+    /// `model_dir` (the standard HuggingFace single-shard layout).
+    pub fn load(
+        model_dir: impl AsRef<Path>,
+        joint_attention_dim: usize,
+        device: Device,
+    ) -> Result<Self> {
+        let dir = model_dir.as_ref();
+        let config: Config = serde_json::from_str(&std::fs::read_to_string(dir.join("config.json"))?)?;
+        if joint_attention_dim % config.hidden_size != 0 {
+            return Err(anyhow!(
+                "text encoder hidden_size {} does not evenly divide the transformer's joint_attention_dim {}",
+                config.hidden_size, joint_attention_dim
+            ));
         }
+        let tile_factor = joint_attention_dim / config.hidden_size;
+
+        let vb = unsafe {
+            VarBuilder::from_mmaped_safetensors(&[dir.join("model.safetensors")], DType::F32, &device)?
+        };
+        let model = Model::new(&config, vb)?;
+        let tokenizer = Tokenizer::from_file(dir.join("tokenizer.json"))
+            .map_err(|e| anyhow!("failed to load tokenizer: {e}"))?;
+
+        Ok(Self { model, tokenizer, device, tile_factor })
     }
 
-    /// Encode using a loaded model
-    fn encode_with_model(&self, _prompt: &str, model_path: &str) -> Result<Tensor> {
-        eprintln!("Loading text encoder from: {}", model_path);
-        // TODO: Implement actual text encoder loading and inference
-        // For now, return placeholder embeddings
-        let batch_size = 1;
-        let seq_len = self.config.max_seq_len;
-        let hidden_size = self.config.hidden_size;
-        Ok(Tensor::randn(0.0f64, 1.0f64, (batch_size, seq_len, hidden_size), &self.device)?)
+    /// Encodes `prompt` into `[1, seq_len, joint_attention_dim]`.
+    pub fn encode(&mut self, prompt: &str) -> Result<Tensor> {
+        let encoding = self
+            .tokenizer
+            .encode(prompt, true)
+            .map_err(|e| anyhow!("tokenizer encode failed: {e}"))?;
+        let input_ids = Tensor::new(encoding.get_ids(), &self.device)?.unsqueeze(0)?;
+        let hidden = self.model.forward(&input_ids, 0)?; // [1, seq_len, hidden_size]
+        let tiles = std::iter::repeat(hidden).take(self.tile_factor).collect::<Vec<_>>();
+        Ok(Tensor::cat(&tiles, D::Minus1)?)
     }
 }

@@ -57,7 +57,8 @@ struct Args {
     #[arg(long)]
     vae_path: Option<String>,
 
-    /// Text encoder model path
+    /// Text encoder model directory (must contain config.json, model.safetensors,
+    /// and tokenizer.json for a standard dense Qwen3 model — see text_encoder.rs)
     #[arg(long)]
     text_encoder_path: Option<String>,
 
@@ -99,19 +100,18 @@ fn load_vae(vae_path: &str, device: &Device, dtype: DType) -> Result<VaeDecoder>
 /// The returned Tensor is independent (lives on device, no model reference).
 fn encode_prompt(
     text_encoder_path: Option<&str>,
-    _prompt: &str,
+    prompt: &str,
     device: &Device,
 ) -> Result<Tensor> {
     eprintln!("[Phase 1] Text encoding");
     let prompt_emb = match text_encoder_path {
         Some(path) => {
             eprintln!("  Loading text encoder from: {}", path);
-            // TODO: implement real text encoder loading (Qwen3-VL 8B)
-            // The model is loaded here and dropped when this scope ends,
-            // freeing ~9.5 GB before the transformer is loaded.
-            let seq_len = 256;
-            let dim = 4096;
-            Tensor::randn(0.0f64, 1.0f64, (1, seq_len, dim), device)?
+            // Not the real Qwen3-Next text encoder (unimplemented — see
+            // text_encoder.rs); a standard dense Qwen3 stand-in, tiled up to
+            // joint_attention_dim. Dropped when this scope ends.
+            let mut encoder = qwen3_image21::text_encoder::TextEncoder::load(path, 4096, device.clone())?;
+            encoder.encode(prompt)?
         }
         None => {
             eprintln!("  No text encoder path, using random embeddings");

@@ -21,8 +21,16 @@ cargo run --release -- --prompt "a cat" --model-path models/diffusion_models/qwe
 cargo run --release -- --prompt "a cat" --model-path models/qwen-image-2.1-Q4_0.gguf --quantized
 cargo run --release -- --prompt "a cat" --model-path <model> --benchmark --benchmark-iterations 5
 
+# With the stand-in text encoder (a directory with config.json/model.safetensors/tokenizer.json
+# for a standard dense Qwen3 model — see text_encoder.rs); omit for random-embedding fallback
+cargo run --release -- --prompt "a cat" --model-path models/qwen-image-2.1-Q4_0.gguf --quantized --text-encoder-path <qwen3-model-dir>
+
 # Inspect a GGUF checkpoint's tensor names/shapes
 cargo run --bin list_tensors
+# Diagnostics used while debugging real-checkpoint loading (see git log for context)
+cargo run --bin vae_probe               # decode synthetic latents directly, bypassing the transformer
+cargo run --bin transformer_probe       # single transformer forward pass, measure output diversity
+cargo run --bin text_encoder_probe [dir] # confirm the text encoder is prompt-dependent
 ```
 
 There is no lint config beyond rustc warnings (`cargo check` surfaces them); there is no CI in this repo.
@@ -42,11 +50,11 @@ There is no lint config beyond rustc warnings (`cargo check` surfaces them); the
 - `attention_mask.rs` — block-causal attention mask: a query may attend to any key at or before it (causal) OR any key in the same image block (`same_image_block AND image_id >= 0`). `build_token_metadata` derives per-token `image_ids`/`target_token_mask` from `img_shapes` — both transformer forward passes must pass the real `img_shapes` here (not `&[]`), otherwise every image token gets `image_id = -1` and the mask silently degenerates to pure causal, losing the bidirectional in-image-block attention the model needs. `select_modulation_rows` only implements the plain (non-`causal_condition`) case — real diffusers' `[batch+1, dim]` trailing-`t=0`-row split for condition-image/editing generation isn't implemented, since nothing in this codebase ever constructs that extra row.
 - `scheduler.rs` — `FlowMatchEuler` (linear sigma schedule, Euler step) and sinusoidal `timestep_embedding`.
 - `vae.rs` — `VaeDecoder` implementing the real `AutoencoderKLQwenImage21` decoder (64-channel latents, `spatial_compression_ratio` = 16, RGBA/4-channel output, real `latents_mean`/`latents_std`). It's a causal-3D VAE (Wan-style) in diffusers, but for single-frame images `QwenImage21CausalConv3d` explicitly collapses to a plain `Conv2d`, so this module implements the decoder as pure 2D — no temporal/frame handling, no feature caching (both are only needed for multi-frame video decoding). Decoder-only: the encoder isn't implemented since the pipeline never encodes images. `dup_up3d()` reproduces the real depth-to-space upsample shortcut exactly (including the `factor_t` parameter, which still measurably changes the result on channel-reducing up-blocks even though the temporal axis itself is always squeezed back to size 1) — see `vae::tests::test_decoder_shapes` for the shape-wiring smoke test. Plus the latent `pack_latents`/`unpack_latents`/`normalize_latents` free functions the pipeline calls between transformer and VAE.
-- `text_encoder.rs` — placeholder only; `main.rs` does not use it (see below) and always generates random embeddings regardless of `--text-encoder-path`.
+- `text_encoder.rs` — **not the real text encoder**: the actual Qwen-Image-2.1 pipeline uses a hybrid Qwen3-Next-style VLM (linear-attention/Mamba2 layers periodically mixed with regular attention — see the real checkpoint's `linear_attn.{A_log,dt_bias,conv1d,in_proj_*}` tensor names) with a non-standard int8 "rotation" quantization scheme (`weight`/`weight_scale`/a 72-byte `comfy_quant` blob per tensor). candle-transformers has no implementation of either the architecture or the quantization format, and building one from scratch was judged out of scope. Instead this loads a real, standard dense `candle_transformers::models::qwen3::Model` (e.g. a local Qwen3-0.6B checkpoint — hidden_size 1024) via `TextEncoder::load(model_dir, joint_attention_dim, device)`, and tiles its hidden states up to the transformer's `joint_attention_dim` (4096 = 1024 × 4) so they still fit through the checkpoint's real, trained `txt_in` layer. This gives genuine, deterministic, prompt-dependent conditioning — confirmed different prompts produce different embeddings and the same prompt is reproducible — but the semantics don't match what `txt_in` was actually trained on, so don't expect coherent images from it alone.
 
 ### Known incomplete pieces (don't assume otherwise)
 
-- **No real text encoder.** `main.rs::encode_prompt` always returns `Tensor::randn` — the prompt content has no effect on output. `text_encoder.rs::TextEncoder` is unused dead scaffolding for the planned Qwen2.5-VL/Qwen3-VL integration.
+- **Text encoder is a dimensionality-matched stand-in, not the real model** (see `text_encoder.rs` above) — expect prompts to have *some* influence, not the real model's semantics.
 - **KV-cache exists but is wired to nothing.** `transformer.rs`/`quantized_transformer.rs` both implement `forward_cached`/`KVCache`, but `pipeline::denoise` always calls the uncached `forward`, and each denoising step recomputes the full sequence.
 - Two independent GGUF-loading code paths exist: `gguf_loader.rs` (dequantize to F32 safetensors, used only by the standalone `test_gguf.rs` probe) vs. `gguf_mapped.rs`/`quantized_transformer.rs` (stay quantized, used by `main.rs --quantized`). Don't conflate them when touching GGUF loading.
 - **`main.rs`'s `--quantized` CLI flag is dead**: `load_transformer` routes purely on whether `--model-path` ends in `.gguf`, never reads the `quantized` argument (rustc even flags it as unused).
@@ -55,4 +63,4 @@ There is no lint config beyond rustc warnings (`cargo check` surfaces them); the
 
 ### Models
 
-`models/` holds real checkpoint files (GGUF and safetensors, multi-GB) plus a HuggingFace `.cache` download-lock directory — not checked into git in spirit even though `.gitignore` currently only excludes `/target` (be careful not to `git add` large binaries here).
+`models/` holds real checkpoint files (GGUF and safetensors, multi-GB) plus a HuggingFace `.cache` download-lock directory — excluded via `.gitignore` (`/models`, alongside `/target`); don't force-add anything under it.
