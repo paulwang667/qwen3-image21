@@ -178,7 +178,7 @@ impl Attention {
         // Reshape to [B, H, S, D]
         let q = q.reshape((b, seq, self.heads, self.dim_head))?.transpose(1, 2)?;
         let k = k.reshape((b, seq, self.heads, self.dim_head))?.transpose(1, 2)?;
-        let v = v.reshape((b, seq, self.heads, self.dim_head))?.transpose(1, 2)?;
+        let v = v.reshape((b, seq, self.heads, self.dim_head))?.transpose(1, 2)?.contiguous()?; // Metal matmul needs contiguous operands
         
         // Apply Q/K normalization
         let q = q.apply(&self.norm_q)?;
@@ -237,7 +237,7 @@ impl Attention {
         // Reshape to [B, H, S, D]
         let q = q.reshape((b, seq, self.heads, self.dim_head))?.transpose(1, 2)?;
         let k = k.reshape((b, seq, self.heads, self.dim_head))?.transpose(1, 2)?;
-        let v = v.reshape((b, seq, self.heads, self.dim_head))?.transpose(1, 2)?;
+        let v = v.reshape((b, seq, self.heads, self.dim_head))?.transpose(1, 2)?.contiguous()?; // Metal matmul needs contiguous operands
         
         // Apply Q/K normalization
         let q = q.apply(&self.norm_q)?;

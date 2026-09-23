@@ -115,7 +115,7 @@ fn encode_prompt(
         }
         None => {
             eprintln!("  No text encoder path, using random embeddings");
-            Tensor::randn(0.0f64, 1.0f64, (1, 256, 4096), device)?
+            Tensor::randn(0.0f32, 1.0f32, (1, 256, 4096), device)? // f32: Metal has no F64 rand_uniform
         }
     };
     eprintln!("  Text encoding done. Encoder released.");
@@ -145,7 +145,10 @@ fn save_image(image: &Tensor, width: usize, height: usize, output: &str) -> Resu
 
 fn main() -> Result<()> {
     let args = Args::parse();
-    let device = Device::cuda_if_available(0)?;
+    // Cargo.toml only enables candle's "metal" feature (no "cuda"), so check for
+    // that instead of CUDA — the previous cuda_if_available() was always false
+    // here and silently ran on CPU regardless of the Metal feature being compiled in.
+    let device = Device::metal_if_available(0)?;
     let dtype = args.precision.as_dtype();
 
     eprintln!("Device: {:?}", device);

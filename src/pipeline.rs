@@ -68,7 +68,8 @@ pub fn denoise(
 
     // Prepare random latents: [B, C, T, H, W] (temporal at index 2)
     let shape = (batch_size, num_channels_latents, 1, latent_h, latent_w);
-    let latents = Tensor::randn(0.0f64, 1.0f64, shape, &cfg.device)?;
+    // f32, not f64: Metal has no F64 rand_uniform kernel.
+    let latents = Tensor::randn(0.0f32, 1.0f32, shape, &cfg.device)?;
     let mut packed_latents = pack_latents(&latents)?.to_dtype(cfg.dtype)?;
     let prompt_emb = prompt_emb.to_dtype(cfg.dtype)?;
 
@@ -93,9 +94,10 @@ pub fn denoise(
 
     // Denoising loop
     for i in 0..num_inference_steps {
-        let t = timesteps[i] as f64;
+        let t = timesteps[i];
         // [B] (batch=1); `timestep_embedding` does its own unsqueeze to broadcast
-        // against the exponent table, so this must stay 1-D here.
+        // against the exponent table, so this must stay 1-D here. f32, not f64:
+        // Metal has no F64->F32 dtype-cast kernel.
         let timestep = Tensor::new(&[t], &cfg.device)?
             .to_dtype(packed_latents.dtype())?;
 

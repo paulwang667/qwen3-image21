@@ -39,8 +39,9 @@ impl EmbedNd {
 
         // Larger frequency tables to handle longer sequences
         // pos_index: 0..8191, neg_index: -1024..-1 (flipped)
-        let pos_index = Tensor::arange(0, 8192, device)?.to_dtype(DType::F32)?;
-        let neg_index = Tensor::arange(1, 1025, device)?
+        // Explicit i64: untyped literals default to i32, and Metal has no I32->F32 cast kernel.
+        let pos_index = Tensor::arange(0i64, 8192i64, device)?.to_dtype(DType::F32)?;
+        let neg_index = Tensor::arange(1i64, 1025i64, device)?
             .to_dtype(DType::F32)?
             .flip(&[0])?
             .affine(-1.0, -1.0)?; // -1024, -1023, ..., -1
