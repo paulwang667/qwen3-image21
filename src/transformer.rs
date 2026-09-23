@@ -191,8 +191,8 @@ impl Attention {
         let k = apply_rope(&k, pe)?;
         // Attention
         let scale = (self.dim_head as f64).powf(-0.5);
-        let mut attn_weights = q.matmul(&k.transpose(2, 3)?)?.affine(1.0 / scale, 0.0)?;
-        
+        let mut attn_weights = q.matmul(&k.transpose(2, 3)?)?.affine(scale, 0.0)?;
+
         // Apply attention mask if provided
         if let Some(mask) = attention_mask {
             // mask: [batch, 1, seq_q, seq_kv] bool, True = attend
@@ -269,7 +269,7 @@ impl Attention {
         
         // Attention
         let scale = (self.dim_head as f64).powf(-0.5);
-        let mut attn_weights = q.matmul(&k_full.transpose(2, 3)?)?.affine(1.0 / scale, 0.0)?;
+        let mut attn_weights = q.matmul(&k_full.transpose(2, 3)?)?.affine(scale, 0.0)?;
         
         // Apply attention mask if provided
         if let Some(mask) = attention_mask {
@@ -390,28 +390,27 @@ impl TransformerBlock {
         attention_mask: Option<&Tensor>,
         _target_token_mask: Option<&Tensor>,
     ) -> Result<Tensor> {
-        // modulation: [B, 4*hidden] -> 4 chunks of [B, hidden], each broadcast over
-        // the sequence axis via a single unsqueeze. Every token in this codebase
-        // uses the same modulation row (no condition-image/target-image split is
-        // implemented — see attention_mask.rs), matching quantized_transformer.rs's
-        // TransformerBlock::forward exactly.
+        // modulation: [B, seq, 4*hidden] -> 4 chunks of [B, seq, hidden]. Already
+        // per-token (text tokens carry a frozen t=0 row, image tokens the real
+        // timestep's row — see QwenImageTransformer::forward's causal_condition
+        // construction), so no broadcast unsqueeze is needed here.
         let parts = modulation.chunk(4, D::Minus1)?;
         let (scale1, gate1, scale2, gate2) = (&parts[0], &parts[1], &parts[2], &parts[3]);
 
         // norm1(x) * (1 + scale1), gate1
         let normed = self.norm1.forward(x)?;
-        let scale1_u = scale1.unsqueeze(1)?.affine(1.0, 1.0)?;
+        let scale1_u = scale1.affine(1.0, 1.0)?;
         let normed = normed.broadcast_mul(&scale1_u)?;
         let attn_out = self.attn.forward(&normed, pe, attention_mask)?;
-        let gate1_u = gate1.tanh()?.unsqueeze(1)?;
+        let gate1_u = gate1.tanh()?;
         let x = x.broadcast_add(&gate1_u.broadcast_mul(&attn_out)?)?;
 
         // norm2(x) * (1 + scale2), gate2
         let normed = self.norm2.forward(&x)?;
-        let scale2_u = scale2.unsqueeze(1)?.affine(1.0, 1.0)?;
+        let scale2_u = scale2.affine(1.0, 1.0)?;
         let normed = normed.broadcast_mul(&scale2_u)?;
         let mlp_out = self.mlp.forward(&normed)?;
-        let gate2_u = gate2.tanh()?.unsqueeze(1)?;
+        let gate2_u = gate2.tanh()?;
         let x = x.broadcast_add(&gate2_u.broadcast_mul(&mlp_out)?)?;
 
         Ok(x)
@@ -427,28 +426,28 @@ impl TransformerBlock {
         _target_token_mask: Option<&Tensor>,
         kv_caches: &mut [KVCache],
     ) -> Result<Tensor> {
-        // See forward() above: every token uses the same modulation row.
+        // See forward() above: modulation is already per-token [B, seq, 4*hidden].
         let parts = modulation.chunk(4, D::Minus1)?;
         let (scale1, gate1, scale2, gate2) = (&parts[0], &parts[1], &parts[2], &parts[3]);
 
         // norm1(x) * (1 + scale1), gate1
         let normed = self.norm1.forward(x)?;
-        let scale1_u = scale1.unsqueeze(1)?.affine(1.0, 1.0)?;
+        let scale1_u = scale1.affine(1.0, 1.0)?;
         let normed = normed.broadcast_mul(&scale1_u)?;
         let attn_out = if let Some(cache) = kv_caches.get_mut(0) {
             self.attn.forward_cached(&normed, pe, attention_mask, Some(cache))?
         } else {
             self.attn.forward_cached(&normed, pe, attention_mask, None)?
         };
-        let gate1_u = gate1.tanh()?.unsqueeze(1)?;
+        let gate1_u = gate1.tanh()?;
         let x = x.broadcast_add(&gate1_u.broadcast_mul(&attn_out)?)?;
 
         // norm2(x) * (1 + scale2), gate2
         let normed = self.norm2.forward(&x)?;
-        let scale2_u = scale2.unsqueeze(1)?.affine(1.0, 1.0)?;
+        let scale2_u = scale2.affine(1.0, 1.0)?;
         let normed = normed.broadcast_mul(&scale2_u)?;
         let mlp_out = self.mlp.forward(&normed)?;
-        let gate2_u = gate2.tanh()?.unsqueeze(1)?;
+        let gate2_u = gate2.tanh()?;
         let x = x.broadcast_add(&gate2_u.broadcast_mul(&mlp_out)?)?;
 
         Ok(x)
@@ -596,10 +595,38 @@ impl QwenImageTransformer {
             x
         };
         let t_emb = self.time_text_embed.forward(timestep)?;
-        
-        // Global modulation (shared across all blocks)
-        let modulation = self.modulation.forward(&t_emb)?;
-        
+
+        // `causal_condition`: text tokens take a dedicated t=0 modulation row
+        // instead of the real, per-step timestep — the model was trained
+        // treating the text prefix as noise-free regardless of the image's
+        // current diffusion step, while only the target-image tokens are
+        // modulated by the actual noise level. The t=0 sinusoidal embedding is
+        // the constant [cos(0)=1,...,1, sin(0)=0,...,0] vector (matching
+        // scheduler::timestep_embedding's cos-then-sin order), so it can be
+        // built directly without a scalar timestep input.
+        let hidden = self.cfg.hidden_size();
+        let modulation_real = self.modulation.forward(&t_emb)?; // [B, 4*hidden]
+        let modulation_real_b = modulation_real.unsqueeze(1)?.broadcast_as((_b, seq_img, 4 * hidden))?;
+        let modulation = if seq_txt > 0 {
+            const SINUSOIDAL_HALF_DIM: usize = 128; // scheduler::timestep_embedding dim=256
+            let zero_sinusoidal = Tensor::cat(
+                &[
+                    Tensor::ones((1, SINUSOIDAL_HALF_DIM), x.dtype(), &self.device)?,
+                    Tensor::zeros((1, SINUSOIDAL_HALF_DIM), x.dtype(), &self.device)?,
+                ],
+                D::Minus1,
+            )?;
+            let zero_t_emb = self.time_text_embed.forward(&zero_sinusoidal)?; // [1, hidden]
+            let modulation_zero = self.modulation.forward(&zero_t_emb)?; // [1, 4*hidden]
+            let modulation_zero_b = modulation_zero
+                .unsqueeze(1)?
+                .broadcast_as((_b, seq_txt, 4 * hidden))?
+                .contiguous()?;
+            Tensor::cat(&[&modulation_zero_b, &modulation_real_b.contiguous()?], 1)?
+        } else {
+            modulation_real_b.contiguous()?
+        };
+
         // Compute RoPE using new QwenImage21Rope API
         // Build image_pad_mask: true for image tokens, false for text (as u8)
         let image_pad_mask: Vec<u8> = vec![0u8; seq_txt].into_iter()
@@ -668,7 +695,7 @@ impl Module for QwenImageTransformer {
 /// Simple attention helper (no mask, no RoPE in this helper).
 pub fn attention(q: &Tensor, k: &Tensor, v: &Tensor, _pe: &Tensor) -> Result<Tensor> {
     let scale = (q.dim(3)? as f64).powf(-0.5);
-    let attn_weights = q.matmul(&k.transpose(2, 3)?)?.affine(1.0 / scale, 0.0)?;
+    let attn_weights = q.matmul(&k.transpose(2, 3)?)?.affine(scale, 0.0)?;
     let attn_weights = candle_nn::ops::softmax(&attn_weights, D::Minus1)?;
     attn_weights.matmul(&v)
 }

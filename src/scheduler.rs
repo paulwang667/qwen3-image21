@@ -117,11 +117,13 @@ pub fn timestep_embedding(t: &Tensor, dim: usize) -> Result<Tensor> {
     // t: [B] -> [B, 1] -> [B, half_dim] -- diffusers uses time_factor=1000.0
     let emb = (t.unsqueeze(1)? * 1000.0)?.broadcast_mul(&exp_table)?;
 
-    // Concatenate sin and cos
+    // Concatenate cos and sin (diffusers' `Timesteps` uses flip_sin_to_cos=True
+    // for this model, i.e. cos comes first — a swapped order here feeds every
+    // element into the wrong trained weight column of linear_1).
     let sin = emb.sin()?;
     let cos = emb.cos()?;
 
-    Tensor::cat(&[sin, cos], D::Minus1)
+    Tensor::cat(&[cos, sin], D::Minus1)
 }
 
 /// TimeEmbedding: two-layer MLP for timestep embedding.

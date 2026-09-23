@@ -117,7 +117,7 @@ impl Attention {
 
         let scale = (self.dim_head as f64).powf(-0.5);
         eprintln!("  [Attention] q.shape={:?}, k.shape={:?}, v.shape={:?}, scale={}", q.shape(), k.shape(), v.shape(), scale);
-        let mut attn_weights = q.matmul(&k.transpose(2, 3)?)?.affine(1.0 / scale, 0.0)?;
+        let mut attn_weights = q.matmul(&k.transpose(2, 3)?)?.affine(scale, 0.0)?;
         eprintln!("  [Attention] after matmul attn_weights.shape={:?}", attn_weights.shape());
         // Apply attention mask: convert bool mask (True=attend) to additive (0/-inf)
         if let Some(mask) = attention_mask {
@@ -182,7 +182,7 @@ impl Attention {
 
         // Attention
         let scale = (self.dim_head as f64).powf(-0.5);
-        let mut attn_weights = q.matmul(&k_full.transpose(2, 3)?)?.affine(1.0 / scale, 0.0)?;
+        let mut attn_weights = q.matmul(&k_full.transpose(2, 3)?)?.affine(scale, 0.0)?;
 
         // Apply attention mask: convert bool mask (True=attend) to additive (0/-inf)
         if let Some(mask) = attention_mask {
@@ -631,7 +631,7 @@ pub fn attention(q: &Tensor, k: &Tensor, v: &Tensor, _pe: &Tensor) -> Result<Ten
     let d = q.dim(3)?;
 
     let scale = (d as f64).powf(-0.5);
-    let attn_weights = q.matmul(&k.transpose(2, 3)?)?.affine(1.0 / scale, 0.0)?;
+    let attn_weights = q.matmul(&k.transpose(2, 3)?)?.affine(scale, 0.0)?;
     let attn_weights = candle_nn::ops::softmax(&attn_weights, D::Minus1)?;
     let attn_out = attn_weights.matmul(&v)?;
 

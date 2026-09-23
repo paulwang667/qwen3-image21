@@ -44,18 +44,18 @@ impl EmbedNd {
         let neg_index = Tensor::arange(1i64, 1025i64, device)?
             .to_dtype(DType::F32)?
             .flip(&[0])?
-            .affine(-1.0, -1.0)?; // -1024, -1023, ..., -1
+            .affine(-1.0, 0.0)?; // -1024, -1023, ..., -1
 
         let mut freqs = Vec::with_capacity(3);
         let mut angles = Vec::with_capacity(3);
         for &dim in &axes_dim {
-            // freq = 1 / theta^(2i/dim) for i in 0..dim/2
+            // freq = theta^(-2i/dim) for i in 0..dim/2, i.e. exp(i * (-2*ln(theta)/dim))
             let half = dim / 2;
-            let pow = Tensor::arange(0, half as i64, device)?
+            let ln_theta = (theta as f64).ln();
+            let inv_freq = Tensor::arange(0, half as i64, device)?
                 .to_dtype(DType::F32)?
-                .affine(-1.0 / dim as f64, 0.0)?
+                .affine(-2.0 * ln_theta / dim as f64, 0.0)?
                 .exp()?; // theta^(-2i/dim)
-            let inv_freq = pow.affine(1.0 / theta as f64, 0.0)?; // 1/theta^(2i/dim)
 
             // pos_freqs = outer(pos_index, inv_freq)
             let pos_outer = pos_index.unsqueeze(1)?.matmul(&inv_freq.unsqueeze(0)?)?; // [8192, half]
@@ -261,4 +261,74 @@ pub fn compute_txt_ids(batch: usize, seq_len: usize, start_idx: usize, device: &
     let zeros = Tensor::zeros(seq_len, DType::F32, device)?;
     let ids = Tensor::stack(&[indices, zeros], 1)?;
     Ok(ids.unsqueeze(0)?.expand((batch as usize, seq_len as usize, 2usize))?)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Hand-computed reference matching the exact upstream `QwenImage21Rope`
+    /// text-to-image formula (direct `coordinate * theta^(-2i/dim)` per axis,
+    /// no lookup table): `cos`/`sin` for one (frame, height, width) coordinate.
+    fn reference_cos_sin(coord: [i64; 3], axes_dim: [usize; 3], theta: f64) -> (Vec<f32>, Vec<f32>) {
+        let mut cos = Vec::new();
+        let mut sin = Vec::new();
+        for (axis, &dim) in axes_dim.iter().enumerate() {
+            for i in 0..(dim / 2) {
+                let freq = theta.powf(-2.0 * i as f64 / dim as f64);
+                let angle = coord[axis] as f64 * freq;
+                cos.push(angle.cos() as f32);
+                sin.push(angle.sin() as f32);
+            }
+        }
+        (cos, sin)
+    }
+
+    /// Regression test for two real bugs found by cross-checking against a
+    /// known-working sibling implementation: (1) the frequency formula computed
+    /// `exp(-i/dim)/theta` instead of `theta^(-2i/dim)` — off by orders of
+    /// magnitude for every component except i=0 — and (2) the negative-position
+    /// table had an off-by-one (`affine(-1.0, -1.0)` instead of `affine(-1.0,
+    /// 0.0)`), so every negative height/width coordinate (half the image grid)
+    /// read the table entry for `position - 1`. Both silently produced a
+    /// near-degenerate RoPE spectrum despite "looking" like it ran correctly.
+    #[test]
+    fn test_embed_nd_matches_reference_formula() {
+        let device = Device::Cpu;
+        let axes_dim = [16usize, 56, 56];
+        let theta = 10000.0;
+        let pe = EmbedNd::new(0, theta, axes_dim, &device).unwrap();
+
+        // text_len=2, image block (frame=1, height=2, width=2): matches the
+        // real single-image T2I layout, just small enough to hand-verify.
+        let img_shapes = [(1usize, 2usize, 2usize)];
+        let image_pad_mask = Tensor::new(&[0u8, 0, 1, 1, 1, 1], &device).unwrap();
+        let out = pe.forward(&img_shapes, &image_pad_mask, &device).unwrap();
+        assert_eq!(out.dims(), &[6, 128]); // sum(axes_dim) = 16+56+56=128 (half*2 per axis)
+
+        // Text token 0: position 0 on all three axes -> angle 0 everywhere -> cos=1, sin=0.
+        let row0: Vec<f32> = out.i(0).unwrap().to_vec1().unwrap();
+        assert!(row0.iter().all(|&v| (v.abs() - 1.0).abs() < 1e-4 || v.abs() < 1e-4));
+
+        // Image tokens start at index 2. With height=width=2, h_start=w_start=-1,
+        // so the four image tokens are (h,w) in {(-1,-1),(-1,0),(0,-1),(0,0)},
+        // each with frame frozen at text_len=2.
+        let expected_hw = [(-1i64, -1i64), (-1, 0), (0, -1), (0, 0)];
+        for (k, &(h, w)) in expected_hw.iter().enumerate() {
+            let row: Vec<f32> = out.i(2 + k).unwrap().to_vec1().unwrap();
+            let (cos, sin) = reference_cos_sin([2, h, w], axes_dim, theta);
+            let mut expected = Vec::with_capacity(cos.len() * 2);
+            for (c, s) in cos.iter().zip(sin.iter()) {
+                expected.push(*c);
+                expected.push(*s);
+            }
+            assert_eq!(row.len(), expected.len());
+            for (got, want) in row.iter().zip(expected.iter()) {
+                assert!(
+                    (got - want).abs() < 1e-3,
+                    "image token {k} (h={h}, w={w}): got {got}, want {want}"
+                );
+            }
+        }
+    }
 }
