@@ -88,27 +88,30 @@ impl RmsNormChannelFirst {
     }
 }
 
-/// Load a 2D conv whose weight this checkpoint stores as a genuine 5D Conv3d
-/// tensor `[out, in, 1, kh, kw]` (every `QwenImage21CausalConv3d` here, even
-/// pointwise ones) — squeeze away the trivial temporal kernel dim of 1 so it
-/// can be used as an ordinary `Conv2d`.
-fn conv2d_3d_weight(
-    in_c: usize,
-    out_c: usize,
-    k: usize,
-    padding: usize,
-    vb: VarBuilder,
-) -> Result<candle_nn::Conv2d> {
-    let ws = vb.get((out_c, in_c, 1, k, k), "weight")?.squeeze(2)?;
-    let bs = vb.get(out_c, "bias")?;
-    Ok(candle_nn::Conv2d::new(ws, Some(bs), Conv2dConfig { padding, ..Default::default() }))
+/// Load a 2D conv. Two checkpoint layouts exist for this VAE:
+/// - **native** (ComfyUI-repackaged, e.g. the community `*_vae_bf16.safetensors`
+///   files): every conv weight is a genuine 5D Conv3d tensor `[out,in,1,kh,kw]`
+///   (even pointwise ones) — squeeze away the trivial temporal dim.
+/// - **diffusers** (the official `Qwen/Qwen-Image-2.1` `vae/` checkpoint): plain
+///   4D `[out,in,kh,kw]` Conv2d weights, loadable directly.
+/// Both stem from the same `QwenImage21CausalConv3d`, which folds away the
+/// temporal axis for single-frame images either way — this is just a storage
+/// difference between the two distributions of the same weights.
+fn load_conv(native: bool, in_c: usize, out_c: usize, k: usize, padding: usize, vb: VarBuilder) -> Result<candle_nn::Conv2d> {
+    if native {
+        let ws = vb.get((out_c, in_c, 1, k, k), "weight")?.squeeze(2)?;
+        let bs = vb.get(out_c, "bias")?;
+        Ok(candle_nn::Conv2d::new(ws, Some(bs), Conv2dConfig { padding, ..Default::default() }))
+    } else {
+        candle_nn::conv2d(in_c, out_c, k, Conv2dConfig { padding, ..Default::default() }, vb)
+    }
 }
 
 /// Residual block: norm1 -> silu -> conv1 -> norm2 -> silu -> conv2, plus a
-/// 1x1 shortcut conv when channel count changes. Matches `QwenImage21ResidualBlock`,
-/// whose weights this checkpoint stores as an indexed `nn.Sequential` (`residual.0`
-/// = norm1, `.2` = conv1, `.3` = norm2, `.6` = conv2 — `.1`/`.4`/`.5` are the
-/// parameter-free SiLU/SiLU/Dropout in between) plus a sibling `shortcut` conv.
+/// 1x1 shortcut conv when channel count changes. Matches `QwenImage21ResidualBlock`.
+/// The native checkpoint stores this as an indexed `nn.Sequential` (`residual.0`
+/// = norm1, `.2` = conv1, `.3` = norm2, `.6` = conv2, sibling `shortcut`); the
+/// diffusers checkpoint uses plain names (`norm1`/`conv1`/`norm2`/`conv2`/`conv_shortcut`).
 #[derive(Debug, Clone)]
 struct ResidualBlock {
     norm1: RmsNormChannelFirst,
@@ -119,13 +122,18 @@ struct ResidualBlock {
 }
 
 impl ResidualBlock {
-    fn new(in_dim: usize, out_dim: usize, vb: VarBuilder) -> Result<Self> {
-        let norm1 = RmsNormChannelFirst::new(in_dim, 3, vb.pp("residual.0"))?;
-        let conv1 = conv2d_3d_weight(in_dim, out_dim, 3, 1, vb.pp("residual.2"))?;
-        let norm2 = RmsNormChannelFirst::new(out_dim, 3, vb.pp("residual.3"))?;
-        let conv2 = conv2d_3d_weight(out_dim, out_dim, 3, 1, vb.pp("residual.6"))?;
+    fn new(in_dim: usize, out_dim: usize, native: bool, vb: VarBuilder) -> Result<Self> {
+        let (p_norm1, p_conv1, p_norm2, p_conv2, p_shortcut) = if native {
+            ("residual.0", "residual.2", "residual.3", "residual.6", "shortcut")
+        } else {
+            ("norm1", "conv1", "norm2", "conv2", "conv_shortcut")
+        };
+        let norm1 = RmsNormChannelFirst::new(in_dim, 3, vb.pp(p_norm1))?;
+        let conv1 = load_conv(native, in_dim, out_dim, 3, 1, vb.pp(p_conv1))?;
+        let norm2 = RmsNormChannelFirst::new(out_dim, 3, vb.pp(p_norm2))?;
+        let conv2 = load_conv(native, out_dim, out_dim, 3, 1, vb.pp(p_conv2))?;
         let conv_shortcut = if in_dim != out_dim {
-            Some(conv2d_3d_weight(in_dim, out_dim, 1, 0, vb.pp("shortcut"))?)
+            Some(load_conv(native, in_dim, out_dim, 1, 0, vb.pp(p_shortcut))?)
         } else {
             None
         };
@@ -194,10 +202,11 @@ struct MidBlock {
 }
 
 impl MidBlock {
-    fn new(dim: usize, vb: VarBuilder) -> Result<Self> {
-        let resnet0 = ResidualBlock::new(dim, dim, vb.pp("0"))?;
-        let attn = AttentionBlock::new(dim, vb.pp("1"))?;
-        let resnet1 = ResidualBlock::new(dim, dim, vb.pp("2"))?;
+    fn new(dim: usize, native: bool, vb: VarBuilder) -> Result<Self> {
+        let (p0, p1, p2) = if native { ("0", "1", "2") } else { ("resnets.0", "attentions.0", "resnets.1") };
+        let resnet0 = ResidualBlock::new(dim, dim, native, vb.pp(p0))?;
+        let attn = AttentionBlock::new(dim, vb.pp(p1))?;
+        let resnet1 = ResidualBlock::new(dim, dim, native, vb.pp(p2))?;
         Ok(Self { resnet0, attn, resnet1 })
     }
 
@@ -249,6 +258,7 @@ impl UpBlock {
         in_dim: usize,
         out_dim: usize,
         num_res_blocks: usize,
+        native: bool,
         up_flag: bool,
         temporal_upsample: bool,
         vb: VarBuilder,
@@ -256,17 +266,23 @@ impl UpBlock {
         let mut resnets = Vec::with_capacity(num_res_blocks + 1);
         let mut current = in_dim;
         for i in 0..=num_res_blocks {
-            resnets.push(ResidualBlock::new(current, out_dim, vb.pp(format!("{}", i)))?);
+            let p = if native { format!("{}", i) } else { format!("resnets.{}", i) };
+            resnets.push(ResidualBlock::new(current, out_dim, native, vb.pp(p))?);
             current = out_dim;
         }
 
         let (upsampler, avg_shortcut_factor_t) = if up_flag {
-            // The resample conv (`upsamples.<i>.upsamples.<num_res_blocks+1>.resample.1`)
-            // is a genuine 2D conv (4D weight), unlike the CausalConv3d-backed resnets above.
+            // The resample conv is a genuine 2D conv (4D weight) in both layouts,
+            // unlike the CausalConv3d-backed resnets above.
+            let p = if native {
+                format!("{}.resample.1", num_res_blocks + 1)
+            } else {
+                "upsampler.resample.1".to_string()
+            };
             let conv = candle_nn::conv2d(
                 out_dim, out_dim, 3,
                 Conv2dConfig { padding: 1, ..Default::default() },
-                vb.pp(format!("{}.resample.1", num_res_blocks + 1)),
+                vb.pp(p),
             )?;
             let factor_t = if temporal_upsample { 2 } else { 1 };
             (Some(conv), Some(factor_t))
@@ -319,12 +335,23 @@ impl VaeDecoder {
         mults.extend(rev);
         let dims: Vec<usize> = mults.iter().map(|&m| dim * m).collect();
 
-        // This checkpoint uses the native (pre-diffusers-port) naming: `conv2` is
-        // post_quant_conv (`conv1` is the encoder's quant_conv, unused here), and
-        // every conv is stored with a genuine 5D Conv3d weight shape.
-        let post_quant_conv = conv2d_3d_weight(cfg.z_dim, cfg.z_dim, 1, 0, vb.pp("conv2"))?;
-        let conv_in = conv2d_3d_weight(cfg.z_dim, dims[0], 3, 1, vb.pp("decoder.conv1"))?;
-        let mid_block = MidBlock::new(dims[0], vb.pp("decoder.middle"))?;
+        // Two checkpoint distributions exist for this VAE, with identical layer
+        // graphs (channel dims, block counts) but different tensor names and
+        // conv-weight ranks — see `load_conv`. "native" is the ComfyUI-repackaged
+        // layout (`conv2`/`decoder.middle`/`decoder.upsamples.<i>.upsamples.<j>`,
+        // 5D conv weights); otherwise this is the official diffusers `vae/`
+        // checkpoint (`post_quant_conv`/`decoder.mid_block`/`decoder.up_blocks.<i>`,
+        // plain 4D conv weights).
+        let native = vb.contains_tensor("conv2.weight");
+        let (p_post_quant_conv, p_conv_in, p_mid_block, p_norm_out, p_conv_out) = if native {
+            ("conv2", "decoder.conv1", "decoder.middle", "decoder.head.0", "decoder.head.2")
+        } else {
+            ("post_quant_conv", "decoder.conv_in", "decoder.mid_block", "decoder.norm_out", "decoder.conv_out")
+        };
+
+        let post_quant_conv = load_conv(native, cfg.z_dim, cfg.z_dim, 1, 0, vb.pp(p_post_quant_conv))?;
+        let conv_in = load_conv(native, cfg.z_dim, dims[0], 3, 1, vb.pp(p_conv_in))?;
+        let mid_block = MidBlock::new(dims[0], native, vb.pp(p_mid_block))?;
 
         let mut temporal_upsample = cfg.temperal_downsample.clone();
         temporal_upsample.reverse();
@@ -334,17 +361,23 @@ impl VaeDecoder {
         for i in 0..dims.len() - 1 {
             let up_flag = i != num_transitions - 1;
             let temporal = up_flag && temporal_upsample.get(i).copied().unwrap_or(false);
+            let p = if native {
+                format!("decoder.upsamples.{}.upsamples", i)
+            } else {
+                format!("decoder.up_blocks.{}", i)
+            };
             let block = UpBlock::new(
-                dims[i], dims[i + 1], cfg.num_res_blocks, up_flag, temporal,
-                vb.pp(format!("decoder.upsamples.{}.upsamples", i)),
+                dims[i], dims[i + 1], cfg.num_res_blocks, native, up_flag, temporal,
+                vb.pp(p),
             )?;
             up_blocks.push(block);
         }
 
-        // `head` is a 3-element Sequential: [0]=norm (RMSNorm), [1]=SiLU (no params), [2]=conv_out.
+        // Native: `head` is a 3-element Sequential ([0]=norm RMSNorm, [1]=SiLU, [2]=conv_out).
+        // Diffusers: plain `norm_out`/`conv_out` names.
         let out_dim = *dims.last().unwrap();
-        let norm_out = RmsNormChannelFirst::new(out_dim, 3, vb.pp("decoder.head.0"))?;
-        let conv_out = conv2d_3d_weight(out_dim, cfg.out_channels, 3, 1, vb.pp("decoder.head.2"))?;
+        let norm_out = RmsNormChannelFirst::new(out_dim, 3, vb.pp(p_norm_out))?;
+        let conv_out = load_conv(native, out_dim, cfg.out_channels, 3, 1, vb.pp(p_conv_out))?;
 
         Ok(Self { post_quant_conv, conv_in, mid_block, up_blocks, norm_out, conv_out })
     }
