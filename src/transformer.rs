@@ -106,10 +106,12 @@ pub struct QwenTimestepProj {
 
 impl QwenTimestepProj {
     fn new(cfg: &Config, vb: candle_nn::VarBuilder) -> Result<Self> {
+        // Caller already scopes vb to "time_text_embed.timestep_embedder" — don't
+        // apply the "timestep_embedder" prefix a second time here.
         let timestep_embedder = TimeEmbedding::new(
             256, // t_dim
             cfg.hidden_size(),
-            vb.pp("timestep_embedder"),
+            vb,
         )?;
         
         Ok(Self {
