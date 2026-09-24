@@ -19,19 +19,17 @@ Each stage (preprocessing, vision tower, text encoder, VAE, transformer, and the
 
 ## Getting the weights
 
-From the official repo [`Qwen/Qwen-Image-2.1`](https://huggingface.co/Qwen/Qwen-Image-2.1) you need `text_encoder/`, `processor/` (tokenizer), `vae/`, and, for full precision, `transformer/`:
-
-```bash
-hf download Qwen/Qwen-Image-2.1 --local-dir models/Qwen-Image-2.1-official
-```
-
-For the quantized path, add a GGUF transformer:
+A quantized GGUF transformer plus the text encoder (17 GB), tokenizer, and VAE (1.4 GB) from the official repo [`Qwen/Qwen-Image-2.1`](https://huggingface.co/Qwen/Qwen-Image-2.1):
 
 ```bash
 hf download unsloth/Qwen-Image-2.1-GGUF qwen-image-2.1-Q4_K_M.gguf --local-dir models
 ```
 
-The GGUF replaces only the transformer; the text encoder and VAE still come from the official repo.
+```bash
+hf download Qwen/Qwen-Image-2.1 --include "text_encoder/*" --include "processor/*" --include "vae/*" --local-dir models/Qwen-Image-2.1-official
+```
+
+For the full-precision transformer instead of the GGUF, add `--include "transformer/*"` (another 14 GB). Repeat `--include` for each pattern; `hf download` reads extra values after one `--include` as file names. Behind a mirror, set `HF_ENDPOINT` (e.g. `https://hf-mirror.com`).
 
 ## Build
 
@@ -51,24 +49,13 @@ PATH=/usr/local/cuda/bin:$PATH CUDA_COMPUTE_CAP=89 cargo build --release --featu
 
 ## Usage
 
-Quantized (GGUF) transformer:
+With the layout above, only the prompt is required:
 
 ```bash
-R=models/Qwen-Image-2.1-official
-./target/release/qwen3-image21 \
-  --prompt "a red apple on a wooden table" \
-  --model-path models/qwen-image-2.1-Q4_K_M.gguf \
-  --vae-path $R/vae/diffusion_pytorch_model.safetensors \
-  --text-encoder-path $R/text_encoder \
-  --height 1024 --width 1024 --steps 20 \
-  --output apple.png
+./target/release/qwen3-image21 --prompt "a red apple on a wooden table" --steps 20 --output apple.png
 ```
 
-Full precision: point `--model-path` at the first transformer shard. The remaining shards are found through the `*.safetensors.index.json` next to it.
-
-```bash
-  --model-path $R/transformer/diffusion_pytorch_model-00001-of-00002.safetensors
-```
+The model paths default to `--model-dir` (`models`): the transformer is the only `.gguf` file there (else the official repo's `transformer/` shards), and the text encoder and VAE come from the official repo, which is either `--model-dir` itself or its one subdirectory containing `text_encoder/config.json`. The resolved paths are printed at startup. With several GGUF files, choose one with `--model-path`; `--model-path`, `--vae-path`, and `--text-encoder-path` always override the defaults. A full-precision `--model-path` is the first transformer shard; the rest are found through the `*.safetensors.index.json` next to it.
 
 Image-conditioned generation (editing): pass one or more `--image`. The output size defaults to the last condition image's aspect ratio at `--output-resolution` (1024² area):
 
@@ -76,9 +63,6 @@ Image-conditioned generation (editing): pass one or more `--image`. The output s
 ./target/release/qwen3-image21 \
   --prompt "Change the apple to a green apple" \
   --image apple.png \
-  --model-path models/qwen-image-2.1-Q4_K_M.gguf \
-  --vae-path $R/vae/diffusion_pytorch_model.safetensors \
-  --text-encoder-path $R/text_encoder \
   --steps 20 --output green_apple.png
 ```
 
@@ -105,10 +89,7 @@ Two 1024×1024 references combined into a 768×1024 poster with Chinese calligra
   --prompt '参考图1中的青花瓷茶杯和图2中的红苹果，设计一张秋日下午茶宣传海报。画面中央是图1的青花瓷茶杯和图2的红苹果，摆放在温暖的木桌上，周围点缀几片金黄的枫叶，背景柔和温暖。海报顶部用大号中文书法艺术字写"秋日茶语"，底部用优雅的中文字体写"一杯清茶 一份甜蜜"。' \
   --image teacup.png --image apple.png \
   --width 768 --height 1024 --steps 20 --seed 14065671437376715125 \
-  --model-path models/qwen-image-2.1-Q4_K_M.gguf --precision bf16 \
-  --vae-path $R/vae/diffusion_pytorch_model.safetensors \
-  --text-encoder-path $R/text_encoder \
-  --output poster.png
+  --precision bf16 --output poster.png
 ```
 
 The teacup keeps reference 1's blue floral pattern, gold rim, and saucer; the apple matches reference 2; both lines of Chinese text render without errors. Each 1024² reference adds 1,024 image tokens to the prompt (2,165 prompt tokens here) and 4,096 latent tokens to the transformer, so this run's sequence is 117 text + 8,192 reference + 3,072 target ≈ 11,400 tokens, and its prefix KV cache is ~4.4 GB (stored in BF16). `--precision bf16` puts the text encoder in BF16; the GGUF transformer still computes in F32.
@@ -123,9 +104,10 @@ The teacup keeps reference 1's blue floral pattern, gold rim, and saucer; the ap
 | `--image` | | Condition image (repeatable). Needs the official text encoder (it contains the vision tower). |
 | `--output-resolution` | `1024` | Condition images are resized to about this² pixels at their own aspect ratio (multiples of 32). |
 | `--steps` | `40` | Upstream default. 20 already gives clean results. |
-| `--model-path` | (required) | `.gguf` → quantized path; otherwise safetensors. |
-| `--vae-path` | | |
-| `--text-encoder-path` | | The official `text_encoder/` directory (a dense Qwen3 stand-in also loads, but gives semantically wrong conditioning). Omitting it uses random embeddings. |
+| `--model-dir` | `models` | Where the three paths below default to (see [Usage](#usage)). |
+| `--model-path` | the `.gguf` in `--model-dir` | `.gguf` → quantized path; otherwise safetensors (first shard). |
+| `--vae-path` | repo's `vae/` | |
+| `--text-encoder-path` | repo's `text_encoder/` | The official `text_encoder/` directory (a dense Qwen3 stand-in also loads, but gives semantically wrong conditioning). With none given or found, random embeddings are used and a warning is printed. |
 | `--negative-prompt` | | Only used when `--true-cfg-scale > 1`. |
 | `--true-cfg-scale` | `1.0` (off) | `neg + scale × (cond − neg)`, no rescaling, as upstream. |
 | `--no-kv-cache` | off | Recompute the text prefix every step (for A/B checks). |

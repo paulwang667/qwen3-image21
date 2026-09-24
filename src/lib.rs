@@ -14,6 +14,7 @@ pub mod qwen3_vl_vision;
 pub mod condition_image;
 pub mod joint_layout;
 pub mod safetensors_util;
+pub mod model_dir;
 
 /// Inference precision for model weights and compute.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, clap::ValueEnum)]

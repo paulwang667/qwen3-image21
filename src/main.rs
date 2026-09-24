@@ -103,17 +103,26 @@ struct Args {
     #[arg(long, default_value_t = 3)]
     benchmark_iterations: usize,
 
-    /// Model path (GGUF or safetensors)
+    /// Directory the model paths below default to: a `.gguf` transformer in it
+    /// and the official repo (`text_encoder/`, `processor/`, `vae/`, optionally
+    /// `transformer/`), either the directory itself or one subdirectory.
+    #[arg(long, default_value = "models")]
+    model_dir: String,
+
+    /// Transformer: a GGUF file or the first shard of the official
+    /// safetensors (default: the only .gguf in --model-dir, else the repo's
+    /// transformer/)
     #[arg(long)]
     model_path: Option<String>,
 
-    /// VAE model path
+    /// VAE safetensors (default: the repo's vae/ in --model-dir)
     #[arg(long)]
     vae_path: Option<String>,
 
     /// Text encoder directory: the official repo's `text_encoder/` (tokenizer
     /// read from the sibling `processor/`), or a dense Qwen3 stand-in — see
-    /// text_encoder.rs. Omit for random embeddings.
+    /// text_encoder.rs (default: the repo's text_encoder/ in --model-dir;
+    /// without one, random embeddings)
     #[arg(long)]
     text_encoder_path: Option<String>,
 
@@ -306,12 +315,22 @@ fn main() -> Result<()> {
     eprintln!("Precision: {:?}", args.precision);
     eprintln!("Quantized: {}", args.quantized);
 
-    if args.model_path.is_none() {
-        return Err(E::msg("Model path (--model-path) is required"));
+    let paths = qwen3_image21::model_dir::resolve(
+        std::path::Path::new(&args.model_dir),
+        args.model_path.as_deref(),
+        args.vae_path.as_deref(),
+        args.text_encoder_path.as_deref(),
+    )?;
+    let model_path = &paths.transformer.to_string_lossy().into_owned();
+    let vae_path = paths.vae.to_string_lossy().into_owned();
+    let vae_path = vae_path.as_str();
+    let text_encoder_path = paths.text_encoder.map(|p| p.to_string_lossy().into_owned());
+    eprintln!("Transformer: {model_path}");
+    eprintln!("VAE: {vae_path}");
+    match &text_encoder_path {
+        Some(p) => eprintln!("Text encoder: {p}"),
+        None => eprintln!("Text encoder: none found under {} — random embeddings, the output will not follow the prompt", args.model_dir),
     }
-
-    let model_path = args.model_path.as_ref().unwrap();
-    let vae_path = args.vae_path.as_ref().map(|s| s.as_str()).unwrap_or(model_path.as_str());
 
     // candle's quantized matmul takes F32 input, so GGUF transformers compute in F32.
     let transformer_dtype = if model_path.ends_with(".gguf") { DType::F32 } else { dtype };
@@ -331,7 +350,7 @@ fn main() -> Result<()> {
         eprintln!("  --negative-prompt ignored: guidance needs --true-cfg-scale > 1");
     }
     let (prompt_emb, negative_emb) = encode_prompt(
-        args.text_encoder_path.as_deref(),
+        text_encoder_path.as_deref(),
         &args.prompt,
         args.negative_prompt.as_deref().filter(|_| do_cfg),
         &condition_images,

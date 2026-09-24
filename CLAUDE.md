@@ -19,18 +19,16 @@ PATH=/usr/local/cuda/bin:$PATH CUDA_COMPUTE_CAP=89 cargo build --release --featu
 cargo test                     # run unit tests (gguf_mapping, attention_mask)
 cargo test test_identity_global   # run a single test by name
 
-# Run inference (requires a real transformer + VAE model on disk; see models/)
-cargo run --release -- --prompt "a cat" --model-path models/diffusion_models/qwen_image_2.1_int8_convrot.safetensors --vae-path models/vae/qwen_image_2.1_vae_bf16.safetensors
-cargo run --release --features cuda -- --prompt "a cat" --model-path models/qwen-image-2.1-Q8_0.gguf --vae-path <repo>/vae/diffusion_pytorch_model.safetensors --text-encoder-path <repo>/text_encoder
+# Run inference. Model paths default to --model-dir (models/): the only *.gguf there
+# (else the official repo's transformer/ shards) + the official repo's text_encoder/ and
+# vae/ (the dir itself or its one subdir with text_encoder/config.json) — see model_dir.rs.
+cargo run --release --features cuda -- --prompt "a cat" --steps 20
+cargo run --release --features cuda -- --prompt "a cat" --model-path models/qwen-image-2.1-Q8_0.gguf   # pick one of several GGUFs
+cargo run --release --features cuda -- --prompt "a cat" --model-path <repo>/transformer/diffusion_pytorch_model-00001-of-00002.safetensors   # full precision
 # Optional true CFG (off by default, as upstream — 2.1 is meant to be sampled without guidance; doubles the cost)
-cargo run --release -- --prompt "a cat" --model-path <model> --negative-prompt "blurry" --true-cfg-scale 4
-cargo run --release -- --prompt "a cat" --model-path <model> --benchmark --benchmark-iterations 5
-
-# Known-good path: official non-quantized weights + official text encoder (Qwen/Qwen-Image-2.1 repo)
-cargo run --release --features cuda -- --prompt "a red apple on a wooden table" --height 1024 --width 1024 --steps 20 \
-  --model-path <repo>/transformer/diffusion_pytorch_model-00001-of-00002.safetensors \
-  --vae-path <repo>/vae/diffusion_pytorch_model.safetensors --text-encoder-path <repo>/text_encoder
-# Omitting --text-encoder-path falls back to random embeddings.
+cargo run --release -- --prompt "a cat" --negative-prompt "blurry" --true-cfg-scale 4
+cargo run --release -- --prompt "a cat" --benchmark --benchmark-iterations 5
+# With no text encoder given or found, random embeddings are used (a warning is printed).
 
 # Inspect a GGUF checkpoint's tensor names/shapes
 cargo run --bin list_tensors
@@ -50,6 +48,7 @@ There is no lint config beyond rustc warnings (`cargo check` surfaces them); the
 
 ### Module map (`src/`)
 
+- `model_dir.rs` — `resolve`: fills in `--model-path` / `--vae-path` / `--text-encoder-path` from `--model-dir` when not given (several GGUFs or several repos → an error asking for the explicit path).
 - `main.rs` — CLI (clap) entry point. Orchestrates the pipeline in explicit **phases**, dropping each model before loading the next to control peak memory: (1) text encoder (with vision tower) loaded → prompt encoded, with any `--image` condition images → dropped, (1b) VAE encoder → condition images to latents (only with `--image`), (2) transformer → denoising loop → dropped, (3) VAE decoder → latents decoded → dropped. After each phase `release_freed_memory` synchronizes the device: candle's CUDA backend frees into a stream-ordered pool that only returns memory to the driver on synchronize, so without it the transformer phase's buffers stayed reserved through the VAE decode. `--precision bf16` loads the full-precision transformer and the GPU text encoder in BF16 (GGUF transformers and the VAE stay F32; latents stay F32 across steps and attention softmax is F32); `--text-encoder-cpu` runs the text encoder + vision tower on the CPU in F32. README's Memory table has the measured peaks. With `--image`, `--height/--width` default to the last condition image's size at `--output-resolution` (as upstream). Benchmark mode instead keeps transformer + VAE resident for repeated timed iterations.
 - `pipeline.rs` — `TransformerType` enum (`NonQuantized`/`Quantized`) dispatches to whichever variant was loaded. `denoise()` runs the Euler flow-matching loop over packed latents; each `PromptEmbeds` carries its own image-slot mask, and `ConditionLatents` (shared by the positive and CFG-negative prompt) are placed into the sequence via `forward_conditioned`. `decode_latents()` unpacks/denormalizes and calls the VAE. The initial noise is drawn on the host from `--seed` (default random): candle's device RNGs start from a fixed state every process (CUDA/Metal) or can't be seeded (CPU), and identical noise is harmful — editing an image generated from the same noise locks the trajectory onto it (oversaturated "HDR" output, reproduced identically by upstream).
 - **Prefix KV cache** (`transformer::TextKvCache`, on by default, `--no-kv-cache` to disable): with `causal_condition` the text and condition-image tokens' per-layer K/V never depend on the timestep or target latents, so `denoise` keeps one cache per prompt (a second for the CFG negative prompt). The cache is filled by a **prefix-only pass** (`prefix_kv`: text + condition tokens, t=0 modulation, block-causal mask over the prefix alone — the prefix never attends to the target, so its K/V equal a full pass's); every step, including the first, then feeds only the target tokens, which attend to `[cached prefix K/V ; target K/V]` without any mask, so the full joint sequence is never materialised (this cut the Q4_K_M edit's transformer-phase peak 12.6→10.5 GiB). With the cache, modulation is one `[B, 1, 4*hidden]` row broadcast over tokens; only the uncached `--no-kv-cache` path still builds per-token rows over the full sequence. Measured at 1024² / 20 steps (text-to-image): Q8_0 67.1→58.0 s, full precision 99.2→89.9 s — almost all of it from dropping the per-layer mask ops, not from skipping ~15 text tokens. `--kv-cache-cpu` (`transformer::set_kv_cache_offload`) keeps the cache in host memory: `to_cache_entry`/`from_cache_entry` move each layer's entries to the device only while that layer runs — bit-identical output, ~2.2 GB less GPU memory per 1024² reference, ~7–10 s slower (pageable-memory copies every step). The cache is stored as `KV_CACHE_DTYPE` (BF16) and cast back to the compute dtype when attended to — with two 1024² references the F32 prefix K/V was ~8.7 GB. `kv_cache_probe` checks exactness (512², cached vs. uncached second step): cosine 0.999997 full precision, 0.9997 Q4_K_M. Before BF16 storage it was ~1e-5 for full precision and ~0.8% for CUDA quantized at 256²+ (candle's quantized matmul numerics depend on the row count).
