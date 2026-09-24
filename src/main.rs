@@ -76,6 +76,13 @@ struct Args {
     #[arg(long)]
     text_encoder_cpu: bool,
 
+    /// Allow TF32 tensor cores for F32 matrix multiplications on CUDA (as
+    /// PyTorch's `allow_tf32`): faster, ~1e-3 relative error per matmul. Only
+    /// F32 matmuls are affected — GGUF linear layers use candle's quantized
+    /// kernels, BF16 matmuls already use tensor cores.
+    #[arg(long)]
+    tf32: bool,
+
     /// Run benchmark mode (multiple iterations)
     #[arg(long)]
     benchmark: bool,
@@ -254,6 +261,7 @@ fn main() -> Result<()> {
         d => d,
     };
     let dtype = args.precision.as_dtype();
+    candle_core::cuda::set_gemm_reduced_precision_f32(args.tf32);
 
     eprintln!("Device: {:?}", device);
     eprintln!("Prompt: {}", args.prompt);

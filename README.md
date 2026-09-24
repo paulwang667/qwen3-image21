@@ -88,7 +88,7 @@ With classifier-free guidance (roughly doubles the denoising time):
 
 ### Multi-reference example
 
-Two 1024×1024 references combined into a 768×1024 poster with Chinese calligraphy lettering (Q4_K_M + `--precision bf16`, 20 steps, 108 s denoising, 20.1 GiB peak GPU memory):
+Two 1024×1024 references combined into a 768×1024 poster with Chinese calligraphy lettering (Q4_K_M + `--precision bf16`, 20 steps, 61 s denoising, 19.2 GiB peak GPU memory):
 
 | Reference 1 | Reference 2 | Result |
 |---|---|---|
@@ -125,6 +125,7 @@ The teacup keeps reference 1's blue floral pattern, gold rim, and saucer; the ap
 | `--no-kv-cache` | off | Recompute the text prefix every step (for A/B checks). |
 | `--precision` | `f32` | `bf16` halves the memory of the full-precision transformer and of the GPU text encoder (see [Memory](#memory)). GGUF transformers and the VAE always compute in F32. `f16` is untested. |
 | `--text-encoder-cpu` | off | Run the text encoder and vision tower on the CPU in F32: frees their GPU memory but adds ~75 s of prompt encoding. |
+| `--tf32` | off | Allow TF32 tensor cores for F32 matmuls on CUDA: full-precision F32 denoising 84 → 60 s at ~2e-4 relative error (BF16 is ~9e-3). No effect on GGUF linear layers or BF16. |
 | `--benchmark`, `--benchmark-iterations` | off, `3` | Keeps transformer + VAE loaded and times repeated runs. |
 | `--seed` | random | Printed at startup; pass it again to reproduce a run. Noise is drawn on the host, so a seed gives the same noise on every device. |
 | `--quantized` | | **Currently ignored**; the backend is chosen by the `--model-path` extension. |
@@ -135,15 +136,16 @@ NVIDIA L20 (46 GB), 1024×1024, 20 steps, denoising time only:
 
 | Transformer | Size on disk | KV cache on | KV cache off |
 |---|---|---|---|
-| Full precision (F32 compute) | 14 GB (BF16) | 89.9 s | 99.2 s |
-| Q8_0 GGUF | 7.6 GB | 58.0 s | 67.1 s |
-| Q4_K_M GGUF | 4.2 GB | 58.3 s | 67.3 s |
+| Full precision (F32 compute) | 14 GB (BF16) | 63.2 s | 70.0 s |
+| Q8_0 GGUF | 7.6 GB | 29.8 s | 38.1 s |
+| Q4_K_M GGUF | 4.2 GB | 30.0 s | 38.2 s |
 
-- Q4_K_M and Q8_0 run at the same speed: candle's CUDA quantized matmul appears to dequantize for sequences this long, so fewer bits mainly save disk and memory.
+- Q4_K_M and Q8_0 run at the same speed: both go through candle's MMQ kernels (activations quantized to q8_1, integer dot products), whose cost here is dominated by other work, so fewer bits mainly save disk and memory.
 - The KV-cache gain comes mostly from dropping the per-layer block-causal attention mask on cached steps, not from skipping the ~15 text tokens.
+- Attention uses candle's fused last-dim softmax. The generic `softmax` (five full passes over the score matrix) took over half of all GPU kernel time in an `nsys` profile; switching roughly halved denoising time for the quantized paths.
 - Accuracy vs. full precision (one forward pass, cosine similarity): Q8_0 0.99986, Q4_K_M 0.99537. Neither shows a visible quality difference.
 
-Image-conditioned generation at 1024×1024 (one 1024² condition image, 20 steps) roughly doubles the sequence to ~8,200 tokens: full precision 135 s, Q4_K_M 102 s. With two 1024² references and a 768×1024 output (~11,400 tokens), Q4_K_M takes 108 s. Attention is computed in chunks of 1,024 query rows so the score matrix never has to fit at once.
+Image-conditioned generation at 1024×1024 (one 1024² condition image, 20 steps) roughly doubles the sequence to ~8,200 tokens: full precision 84 s (F32) / 60 s (`--tf32`) / 57 s (`--precision bf16`), Q4_K_M 49 s. With two 1024² references and a 768×1024 output (~11,400 tokens), Q4_K_M takes 61 s. Attention is computed in chunks of 1,024 query rows so the score matrix never has to fit at once.
 
 ### Memory
 
@@ -153,16 +155,16 @@ Peak GPU memory (sampled with `nvidia-smi` every 100 ms), 1024² image-condition
 
 | Transformer | Text encoder | Peak (GiB) | Text encoding | Denoising | Wall |
 |---|---|---|---|---|---|
-| Full, F32 (default) | GPU, F32 | 39.4 | 6 s | 136 s | 151 s |
-| Full, `--precision bf16` | GPU, BF16 | 24.0 | 5 s | 106 s | 119 s |
-| Full, `--precision bf16` | `--text-encoder-cpu` | 23.9 | 81 s | 106 s | 194 s |
-| Q4_K_M | GPU, F32 (default) | 35.0 | 6 s | 102 s | 115 s |
-| Q4_K_M, `--precision bf16` | GPU, BF16 | 18.8 | 5 s | 101 s | — |
-| Q4_K_M | `--text-encoder-cpu` | 14.9 | 79 s | 101 s | 186 s |
+| Full, F32 (default) | GPU, F32 | 36.5 | 6 s | 84 s | 98 s |
+| Full, `--precision bf16` | GPU, BF16 | 23.0 | 5 s | 57 s | 69 s |
+| Full, `--precision bf16` | `--text-encoder-cpu` | 23.0 | 77 s | 57 s | 140 s |
+| Q4_K_M | GPU, F32 (default) | 35.0 | 6 s | 49 s | 62 s |
+| Q4_K_M, `--precision bf16` | GPU, BF16 | 18.8 | 5 s | 49 s | 60 s |
+| Q4_K_M | `--text-encoder-cpu` | 13.0 | 78 s | 49 s | 133 s |
 
 - With a GGUF transformer, `--precision bf16` only changes the text encoder. **Q4_K_M + `--precision bf16`** is the practical low-memory setting: under 19 GiB at full speed.
 - The peak is whichever phase is largest: the text encoder (~34 GB F32 / ~17 GB BF16 of weights) or the transformer phase (weights, activations, and the prefix KV cache, which grows with the number of condition images).
-- The prefix KV cache is always stored in BF16 (cast back to the compute dtype when attended to): for the two-reference poster above it is ~4.4 GB instead of ~8.7 GB, lowering that run's peak from 26.2 to 20.1 GiB. Cached vs. uncached step (`kv_cache_probe`, 512²): cosine 0.999997 for full precision, 0.9997 for Q4_K_M; the poster rendered with the same seed differs from the F32-cache version by a mean 1.4/255, with no visible difference.
+- The prefix KV cache is always stored in BF16 (cast back to the compute dtype when attended to): for the two-reference poster above it is ~4.4 GB instead of ~8.7 GB, lowering that run's peak from 26.2 to 20.1 GiB (19.2 GiB after the fused softmax, now bounded by the text-encoder phase). Cached vs. uncached step (`kv_cache_probe`, 512²): cosine 0.999997 for full precision, 0.9997 for Q4_K_M; the poster rendered with the same seed differs from the F32-cache version by a mean 1.4/255, with no visible difference.
 - BF16 accuracy vs. the F32 golden tensors (cosine): transformer 0.99996, text encoder 0.995, vision tower 0.996. The latents stay F32 across denoising steps and attention softmax runs in F32. In the runs above the output images differ from the F32 run by a mean 0.3 (BF16) and 1.3–1.4 (Q4_K_M) on a 0–255 scale, with no visible difference.
 
 ## Project layout
@@ -209,7 +211,7 @@ cargo test    # unit tests (RoPE vs. reference formula, dup_up3d, scheduler, att
 - Condition images are resized with the `image` crate's Lanczos3, close to but not bit-identical with upstream's PIL resize.
 - `--precision bf16` has been verified (see [Memory](#memory)); `f16` is untested.
 - End-to-end quality has been verified on CUDA only. The CPU path was checked at the single-forward level (quantized on CPU matches full precision); Metal has not been re-verified since the correctness fixes.
-- No flash attention: attention scores are materialised in full.
+- No flash attention: attention scores are materialised one 1,024-row chunk at a time.
 
 ## License
 

@@ -74,6 +74,8 @@ fn main() -> Result<()> {
         Ok("f16") => DType::F16,
         _ => DType::F32,
     };
+    // I2I_TF32=1 allows TF32 for F32 matmuls (the CLI's --tf32).
+    candle_core::cuda::set_gemm_reduced_precision_f32(std::env::var("I2I_TF32").as_deref() == Ok("1"));
 
     match stage {
         "vae" => {

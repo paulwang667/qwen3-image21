@@ -191,12 +191,14 @@ const ATTENTION_CHUNK_ROWS: usize = 1024;
 /// tensor, true where attending is allowed.
 pub(crate) fn chunked_attention(q: &Tensor, k: &Tensor, v: &Tensor, scale: f64, mask: Option<&Tensor>) -> Result<Tensor> {
     let sq = q.dim(2)?;
+    // Scale q (head_dim wide) rather than the scores (key-length wide).
+    let q = q.affine(scale, 0.0)?;
     let kt = k.transpose(2, 3)?.contiguous()?;
     let mut outs = Vec::with_capacity(sq.div_ceil(ATTENTION_CHUNK_ROWS));
     for start in (0..sq).step_by(ATTENTION_CHUNK_ROWS) {
         let len = ATTENTION_CHUNK_ROWS.min(sq - start);
         let q_chunk = q.narrow(2, start, len)?.contiguous()?;
-        let mut w = q_chunk.matmul(&kt)?.affine(scale, 0.0)?;
+        let mut w = q_chunk.matmul(&kt)?;
         if let Some(mask) = mask {
             let m = if mask.dim(2)? == 1 { mask.clone() } else { mask.narrow(2, start, len)? };
             // Additive mask: 0 where allowed, -inf where masked.
@@ -205,7 +207,9 @@ pub(crate) fn chunked_attention(q: &Tensor, k: &Tensor, v: &Tensor, scale: f64, 
             w = w.broadcast_add(&m.where_cond(&zero, &neg_inf)?)?;
         }
         // Softmax in F32 even for BF16/F16 weights; exp/sum lose too much otherwise.
-        let w = candle_nn::ops::softmax(&w.to_dtype(DType::F32)?, D::Minus1)?.to_dtype(v.dtype())?;
+        // The fused last-dim kernel: the generic `softmax` runs five full passes
+        // over the scores and took over half the denoising time.
+        let w = candle_nn::ops::softmax_last_dim(&w.to_dtype(DType::F32)?)?.to_dtype(v.dtype())?;
         outs.push(w.matmul(v)?);
     }
     Tensor::cat(&outs, 2)
