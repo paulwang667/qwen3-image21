@@ -14,7 +14,7 @@ Each stage (preprocessing, vision tower, text encoder, VAE, transformer, and the
 - **Prefix KV cache**: the per-layer K/V of the text and condition-image tokens are computed once and reused across denoising steps (on by default, as upstream).
 - **FlowMatch Euler scheduler** with the checkpoint's resolution-dependent exponential shift and `shift_terminal`.
 - **VAE**: `AutoencoderKLQwenImage21` decoder and encoder, 64-channel latents, 16× spatial compression, RGBA (output saved as RGB). The decoder loads both the official diffusers layout and the ComfyUI-repackaged layout; the encoder needs the official one.
-- **Image-conditioned generation** (`--image`, repeatable): the condition image is read by the Qwen3-VL vision tower as part of the prompt and VAE-encoded into latent tokens placed in the prompt's image slots, as in upstream `QwenImage21Pipeline`. Works for edits ("change the apple to a green apple"), style changes ("turn this photo into a watercolor painting"), and object replacement.
+- **Image-conditioned generation** (`--image`, repeatable): the condition image is read by the Qwen3-VL vision tower as part of the prompt and VAE-encoded into latent tokens placed in the prompt's image slots, as in upstream `QwenImage21Pipeline`. Works for edits ("change the apple to a green apple"), style changes ("turn this photo into a watercolor painting"), object replacement, and composing several references into one image (see [Multi-reference example](#multi-reference-example)).
 - **Optional true CFG** (`--negative-prompt` + `--true-cfg-scale`), off by default like upstream, since 2.1 is meant to be sampled without guidance.
 
 ## Getting the weights
@@ -76,6 +76,8 @@ Image-conditioned generation (editing): pass one or more `--image`. The output s
   --steps 20 --output green_apple.png
 ```
 
+With several references, repeat `--image`; the prompt can refer to them as "image 1", "image 2", … in the order given (upstream labels them `<image1>`, `<image2>`, … in the prompt template). `--width`/`--height` can differ from the references' size and aspect ratio.
+
 Don't edit an image with the seed it was generated from: identical starting noise locks the edit onto the original and produces an oversaturated copy. The default random seed avoids this.
 
 With classifier-free guidance (roughly doubles the denoising time):
@@ -83,6 +85,27 @@ With classifier-free guidance (roughly doubles the denoising time):
 ```bash
   --negative-prompt "blurry, low quality" --true-cfg-scale 4
 ```
+
+### Multi-reference example
+
+Two 1024×1024 references combined into a 768×1024 poster with Chinese calligraphy lettering (Q4_K_M, 20 steps, 108 s denoising):
+
+| Reference 1 | Reference 2 | Result |
+|---|---|---|
+| <img src="docs/images/ref1_teacup.jpg" width="240"> | <img src="docs/images/ref2_apple.jpg" width="240"> | <img src="docs/images/poster_multi_ref.jpg" width="240"> |
+
+```bash
+./target/release/qwen3-image21 \
+  --prompt '参考图1中的青花瓷茶杯和图2中的红苹果，设计一张秋日下午茶宣传海报。画面中央是图1的青花瓷茶杯和图2的红苹果，摆放在温暖的木桌上，周围点缀几片金黄的枫叶，背景柔和温暖。海报顶部用大号中文书法艺术字写"秋日茶语"，底部用优雅的中文字体写"一杯清茶 一份甜蜜"。' \
+  --image teacup.png --image apple.png \
+  --width 768 --height 1024 --steps 20 \
+  --model-path models/qwen-image-2.1-Q4_K_M.gguf \
+  --vae-path $R/vae/diffusion_pytorch_model.safetensors \
+  --text-encoder-path $R/text_encoder \
+  --output poster.png
+```
+
+The teacup keeps reference 1's blue floral pattern, gold rim, and saucer; the apple matches reference 2; both lines of Chinese text render without errors. Each 1024² reference adds 1,024 image tokens to the prompt (2,165 prompt tokens here) and 4,096 latent tokens to the transformer, so this run's sequence is 117 text + 8,192 reference + 3,072 target ≈ 11,400 tokens, and its prefix KV cache is ~8.7 GB in F32. A GGUF transformer was used because full precision already peaks at ~44 GB with one reference, and the second adds ~4.4 GB of cache, which likely exceeds a 46 GB GPU. That is an estimate, not a measurement.
 
 ### Options
 
@@ -119,7 +142,7 @@ NVIDIA L20 (46 GB), 1024×1024, 20 steps, denoising time only:
 - The KV-cache gain comes mostly from dropping the per-layer block-causal attention mask on cached steps, not from skipping the ~15 text tokens.
 - Accuracy vs. full precision (one forward pass, cosine similarity): Q8_0 0.99986, Q4_K_M 0.99537. Neither shows a visible quality difference.
 
-Image-conditioned generation at 1024×1024 (one 1024² condition image, 20 steps) roughly doubles the sequence to ~8,200 tokens: full precision 135 s (peak ~44 GB on the 46 GB L20), Q4_K_M 102 s. Attention is computed in chunks of 1,024 query rows so the score matrix never has to fit at once.
+Image-conditioned generation at 1024×1024 (one 1024² condition image, 20 steps) roughly doubles the sequence to ~8,200 tokens: full precision 135 s (peak ~44 GB on the 46 GB L20), Q4_K_M 102 s. With two 1024² references and a 768×1024 output (~11,400 tokens), Q4_K_M takes 108 s. Attention is computed in chunks of 1,024 query rows so the score matrix never has to fit at once.
 
 Models are loaded in phases (text encoder → VAE encoder for condition images → transformer → VAE decoder), each dropped before the next. Everything is loaded as F32. For text-to-image, peak memory is the text-encoder phase (about 34 GB of F32 weights, estimated from the 17 GB BF16 checkpoint); image-conditioned generation in full precision peaks in the transformer phase (~44 GB measured at 1024²), so use a GGUF transformer on smaller GPUs.
 
