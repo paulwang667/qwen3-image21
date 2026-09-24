@@ -25,6 +25,9 @@ use tokenizers::Tokenizer;
 
 use crate::safetensors_util::resolve_safetensors_paths;
 
+/// System prompt of the upstream Qwen-Image-2.1 text-to-image prompt template.
+const OFFICIAL_SYSTEM_PROMPT: &str = "Comprehend and analyze the provided prompt.";
+
 enum Backend {
     Official(crate::qwen3_vl_text::Qwen3VLTextEncoder),
     StandIn { model: candle_transformers::models::qwen3::Model, tile_factor: usize },
@@ -106,11 +109,25 @@ impl TextEncoder {
 
     /// Encodes `prompt` into `[1, seq_len, joint_attention_dim]`.
     pub fn encode(&mut self, prompt: &str) -> Result<Tensor> {
-        let encoding = self.tokenizer.encode(prompt, true).map_err(|e| anyhow!("tokenizer encode failed: {e}"))?;
-        let input_ids = Tensor::new(encoding.get_ids(), &self.device)?.unsqueeze(0)?;
+        let tokenizer = &self.tokenizer;
+        let tokenize = |text: &str| -> Result<Vec<u32>> {
+            Ok(tokenizer.encode(text, true).map_err(|e| anyhow!("tokenizer encode failed: {e}"))?.get_ids().to_vec())
+        };
         match &mut self.backend {
-            Backend::Official(model) => Ok(model.forward(&input_ids)?), // [1, seq_len, hidden_size], already matches joint_attention_dim
+            Backend::Official(model) => {
+                // Upstream wraps the prompt in this raw template (not
+                // apply_chat_template), encodes it, then drops the hidden states
+                // of the system-role prefix.
+                let prompt = if prompt.is_empty() { " " } else { prompt };
+                let system = format!("<|im_start|>system\n{OFFICIAL_SYSTEM_PROMPT}<|im_end|>\n");
+                let ids = tokenize(&format!("{system}<|im_start|>user\n{prompt}<|im_end|>\n<|im_start|>assistant\n"))?;
+                let drop_idx = tokenize(&system)?.len();
+                let input_ids = Tensor::new(ids.as_slice(), &self.device)?.unsqueeze(0)?;
+                let hidden = model.forward(&input_ids)?; // [1, seq_len, 4096]
+                Ok(hidden.narrow(1, drop_idx, ids.len() - drop_idx)?)
+            }
             Backend::StandIn { model, tile_factor } => {
+                let input_ids = Tensor::new(tokenize(prompt)?.as_slice(), &self.device)?.unsqueeze(0)?;
                 let hidden = model.forward(&input_ids, 0)?; // [1, seq_len, hidden_size]
                 if *tile_factor == 1 {
                     return Ok(hidden);

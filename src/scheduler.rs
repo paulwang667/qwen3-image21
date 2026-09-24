@@ -18,7 +18,6 @@ const MAX_SHIFT: f32 = 0.9;
 const BASE_IMAGE_SEQ_LEN: usize = 256;
 const MAX_IMAGE_SEQ_LEN: usize = 8192;
 const SHIFT_TERMINAL: f32 = 0.02;
-const NUM_TRAIN_TIMESTEPS: f32 = 1000.0;
 
 impl FlowMatchEuler {
     /// `image_seq_len` is the number of image tokens (patches) being denoised —
@@ -27,8 +26,8 @@ impl FlowMatchEuler {
     pub fn new(num_inference_steps: usize, image_seq_len: usize) -> Self {
         let mu = calculate_shift(image_seq_len, BASE_IMAGE_SEQ_LEN, MAX_IMAGE_SEQ_LEN, BASE_SHIFT, MAX_SHIFT);
 
-        let sigma_min = 1.0 / NUM_TRAIN_TIMESTEPS;
-        let mut sigmas = linspace(1.0, sigma_min, num_inference_steps);
+        // The Qwen-Image pipelines pass `np.linspace(1.0, 1/num_inference_steps, n)`.
+        let mut sigmas = linspace(1.0, 1.0 / num_inference_steps as f32, num_inference_steps);
         for s in sigmas.iter_mut() {
             *s = time_shift_exponential(mu, 1.0, *s);
         }

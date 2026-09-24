@@ -224,7 +224,7 @@ impl GatedMlp {
     fn forward(&self, x: &Tensor) -> Result<Tensor> {
         let proj = x.apply(&self.proj)?;
         let gate = x.apply(&self.gate_layer)?;
-        let gated = proj.silu()?.broadcast_mul(&gate)?;
+        let gated = gate.silu()?.broadcast_mul(&proj)?;
         gated.apply(&self.out)
     }
 }

@@ -298,7 +298,8 @@ impl Attention {
 /// - gate_layer: [hidden_size] -> [mlp_hidden_size]
 /// - out: [mlp_hidden_size] -> [hidden_size]
 /// 
-/// Forward: out(silu(proj(x)) * gate_layer(x))
+/// Forward: out(silu(gate_layer(x)) * proj(x)) — matches upstream
+/// `QwenImage21SwiGLUFeedForward`; the activation is on `gate_layer`, not `proj`.
 #[derive(Debug, Clone)]
 struct GatedMlp {
     proj: Linear,
@@ -321,7 +322,7 @@ impl GatedMlp {
     fn forward(&self, x: &Tensor) -> Result<Tensor> {
         let proj = x.apply(&self.proj)?;
         let gate = x.apply(&self.gate_layer)?;
-        let gated = proj.silu()?.broadcast_mul(&gate)?;
+        let gated = gate.silu()?.broadcast_mul(&proj)?;
         gated.apply(&self.out)
     }
 }

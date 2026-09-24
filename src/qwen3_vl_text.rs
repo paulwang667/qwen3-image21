@@ -184,7 +184,6 @@ impl DecoderLayer {
 pub struct Qwen3VLTextEncoder {
     embed_tokens: Embedding,
     layers: Vec<DecoderLayer>,
-    norm: RmsNorm,
     device: Device,
     dtype: DType,
 }
@@ -201,8 +200,9 @@ impl Qwen3VLTextEncoder {
         for i in 0..cfg.num_hidden_layers {
             layers.push(DecoderLayer::new(rotary_emb.clone(), cfg, vb_l.pp(i))?);
         }
-        let norm = rms_norm(cfg.hidden_size, cfg.rms_norm_eps, vb_m.pp("norm"))?;
-        Ok(Self { embed_tokens, layers, norm, device: vb.device().clone(), dtype: vb.dtype() })
+        // The final `model.language_model.norm` is deliberately not loaded:
+        // Qwen-Image-2.1 conditions on the last decoder state *before* it.
+        Ok(Self { embed_tokens, layers, device: vb.device().clone(), dtype: vb.dtype() })
     }
 
     fn causal_mask(&self, seq_len: usize) -> Result<Tensor> {
@@ -212,7 +212,8 @@ impl Qwen3VLTextEncoder {
         Tensor::from_slice(&mask, (1, 1, seq_len, seq_len), &self.device)?.to_dtype(self.dtype)
     }
 
-    /// Encodes token ids `[1, seq_len]` into hidden states `[1, seq_len, hidden_size]`.
+    /// Encodes token ids `[1, seq_len]` into the final decoder layer's output
+    /// `[1, seq_len, hidden_size]`, before the model's final RMSNorm.
     pub fn forward(&self, input_ids: &Tensor) -> Result<Tensor> {
         let seq_len = input_ids.dim(1)?;
         let causal_mask = self.causal_mask(seq_len)?;
@@ -220,6 +221,6 @@ impl Qwen3VLTextEncoder {
         for layer in &self.layers {
             xs = layer.forward(&xs, &causal_mask)?;
         }
-        xs.apply(&self.norm)
+        Ok(xs)
     }
 }
