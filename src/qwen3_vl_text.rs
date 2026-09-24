@@ -261,10 +261,20 @@ impl DecoderLayer {
     }
 }
 
+/// Where the decoder layers' weights live.
+enum Layers {
+    /// All layers on the device.
+    Resident(Vec<DecoderLayer>),
+    /// Each layer is built from the (mmap-backed) `vb` right before it runs and
+    /// dropped right after, so only one layer's weights (~0.4 GB in BF16) are
+    /// on the device at a time; the embedding table stays in host memory.
+    Streamed { cfg: TextConfig, vb: VarBuilder<'static> },
+}
+
 /// The official Qwen-Image-2.1 text encoder: the Qwen3-VL language model.
 pub struct Qwen3VLTextEncoder {
     embed_tokens: Embedding,
-    layers: Vec<DecoderLayer>,
+    layers: Layers,
     rope: MultimodalRope,
     device: Device,
     dtype: DType,
@@ -274,12 +284,6 @@ impl Qwen3VLTextEncoder {
     pub fn new(cfg: &TextConfig, vb: VarBuilder) -> Result<Self> {
         let vb_m = vb.pp("model").pp("language_model");
         let embed_tokens = embedding(cfg.vocab_size, cfg.hidden_size, vb_m.pp("embed_tokens"))?;
-        let section = match cfg.rope_scaling.as_ref().map(|r| r.mrope_section.as_slice()) {
-            Some(&[t, h, w]) => [t, h, w],
-            // No section: every frequency reads the T axis, i.e. plain 1D RoPE.
-            _ => [cfg.head_dim / 2, 0, 0],
-        };
-        let rope = MultimodalRope::new(cfg.rope_theta as f32, cfg.head_dim, section);
         let vb_l = vb_m.pp("layers");
         let mut layers = Vec::with_capacity(cfg.num_hidden_layers);
         for i in 0..cfg.num_hidden_layers {
@@ -287,7 +291,26 @@ impl Qwen3VLTextEncoder {
         }
         // The final `model.language_model.norm` is deliberately not loaded:
         // Qwen-Image-2.1 conditions on the last decoder state *before* it.
-        Ok(Self { embed_tokens, layers, rope, device: vb.device().clone(), dtype: vb.dtype() })
+        Ok(Self { embed_tokens, layers: Layers::Resident(layers), rope: Self::rope(cfg), device: vb.device().clone(), dtype: vb.dtype() })
+    }
+
+    /// Like [`Self::new`], but streams the decoder layers onto `vb`'s device
+    /// one at a time during each forward pass (see [`Layers::Streamed`]).
+    pub fn new_streamed(cfg: &TextConfig, vb: VarBuilder<'static>) -> Result<Self> {
+        let (device, dtype) = (vb.device().clone(), vb.dtype());
+        let vb_m = vb.pp("model").pp("language_model");
+        let embed_tokens = embedding(cfg.vocab_size, cfg.hidden_size, vb_m.pp("embed_tokens").set_device(Device::Cpu))?;
+        let layers = Layers::Streamed { cfg: cfg.clone(), vb: vb_m.pp("layers") };
+        Ok(Self { embed_tokens, layers, rope: Self::rope(cfg), device, dtype })
+    }
+
+    fn rope(cfg: &TextConfig) -> MultimodalRope {
+        let section = match cfg.rope_scaling.as_ref().map(|r| r.mrope_section.as_slice()) {
+            Some(&[t, h, w]) => [t, h, w],
+            // No section: every frequency reads the T axis, i.e. plain 1D RoPE.
+            _ => [cfg.head_dim / 2, 0, 0],
+        };
+        MultimodalRope::new(cfg.rope_theta as f32, cfg.head_dim, section)
     }
 
     fn causal_mask(&self, seq_len: usize) -> Result<Tensor> {
@@ -309,7 +332,8 @@ impl Qwen3VLTextEncoder {
     pub fn forward_with_images(&self, input_ids: &Tensor, images: Option<&ImageFeatures>) -> Result<Tensor> {
         let seq_len = input_ids.dim(1)?;
         let ids: Vec<u32> = input_ids.flatten_all()?.to_vec1()?;
-        let mut xs = self.embed_tokens.forward(input_ids)?;
+        let ids_on_table = input_ids.to_device(self.embed_tokens.embeddings().device())?;
+        let mut xs = self.embed_tokens.forward(&ids_on_table)?.to_device(&self.device)?;
         let (positions, image_mask) = match images {
             Some(img) => {
                 let mask: Vec<bool> = ids.iter().map(|&id| id == img.image_token_id).collect();
@@ -320,8 +344,15 @@ impl Qwen3VLTextEncoder {
         };
         let (cos, sin) = self.rope.cos_sin(&positions, &self.device, self.dtype)?;
         let causal_mask = self.causal_mask(seq_len)?;
-        for (i, layer) in self.layers.iter().enumerate() {
-            xs = layer.forward(&xs, &causal_mask, &cos, &sin)?;
+        let num_layers = match &self.layers {
+            Layers::Resident(layers) => layers.len(),
+            Layers::Streamed { cfg, .. } => cfg.num_hidden_layers,
+        };
+        for i in 0..num_layers {
+            xs = match &self.layers {
+                Layers::Resident(layers) => layers[i].forward(&xs, &causal_mask, &cos, &sin)?,
+                Layers::Streamed { cfg, vb } => DecoderLayer::new(cfg, vb.pp(i))?.forward(&xs, &causal_mask, &cos, &sin)?,
+            };
             if let (Some(img), Some(mask)) = (images, &image_mask) {
                 if let Some(feat) = img.deepstack.get(i) {
                     xs = scatter_rows(&xs, mask, feat, true)?;

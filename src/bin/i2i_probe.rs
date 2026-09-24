@@ -179,7 +179,12 @@ fn main() -> Result<()> {
             let (h, w, _) = rgba.dims3()?;
             let img = image::RgbaImage::from_raw(w as u32, h as u32, rgba.flatten_all()?.to_vec1::<u8>()?).unwrap();
             let cond = qwen3_image21::condition_image::from_rgba(&img, &dev)?;
-            let mut encoder = qwen3_image21::text_encoder::TextEncoder::load(format!("{root}/text_encoder"), 4096, dev.clone(), candle_core::DType::F32)?;
+            // I2I_STREAM=1 streams the language-model layers (--stream-text-encoder).
+            let mut encoder = if std::env::var("I2I_STREAM").as_deref() == Ok("1") {
+                qwen3_image21::text_encoder::TextEncoder::load_streamed(format!("{root}/text_encoder"), 4096, dev.clone(), candle_core::DType::F32)?
+            } else {
+                qwen3_image21::text_encoder::TextEncoder::load(format!("{root}/text_encoder"), 4096, dev.clone(), candle_core::DType::F32)?
+            };
             let (embeds, slots) = encoder.encode_with_images("Change the apple to a green apple", std::slice::from_ref(&cond))?;
             let want_slots: Vec<bool> = load(&ref_dir, "text", "image_pad_mask", &Device::Cpu)?
                 .flatten_all()?.to_vec1::<f32>()?.iter().map(|&v| v > 0.5).collect();

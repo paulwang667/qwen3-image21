@@ -67,7 +67,18 @@ impl TextEncoder {
     /// with weights in `dtype` on `device` (e.g. F32 on the CPU to keep the
     /// ~34 GB F32 encoder off the GPU, or BF16 on the GPU to halve it).
     pub fn load(model_dir: impl AsRef<Path>, joint_attention_dim: usize, device: Device, dtype: DType) -> Result<Self> {
-        let dir = model_dir.as_ref();
+        Self::load_with(model_dir.as_ref(), joint_attention_dim, device, dtype, false)
+    }
+
+    /// Like [`Self::load`], but the official encoder's language-model layers are
+    /// streamed onto `device` one at a time during encoding instead of being
+    /// resident (see `qwen3_vl_text::Qwen3VLTextEncoder::new_streamed`). The
+    /// stand-in layout is always loaded resident.
+    pub fn load_streamed(model_dir: impl AsRef<Path>, joint_attention_dim: usize, device: Device, dtype: DType) -> Result<Self> {
+        Self::load_with(model_dir.as_ref(), joint_attention_dim, device, dtype, true)
+    }
+
+    fn load_with(dir: &Path, joint_attention_dim: usize, device: Device, dtype: DType, streamed: bool) -> Result<Self> {
         let config_json: serde_json::Value = serde_json::from_str(&std::fs::read_to_string(dir.join("config.json"))?)?;
         let tokenizer_path = find_tokenizer(dir)?;
         let tokenizer = Tokenizer::from_file(&tokenizer_path).map_err(|e| anyhow!("failed to load tokenizer: {e}"))?;
@@ -96,7 +107,11 @@ impl TextEncoder {
             eprintln!("  Loading official text encoder from {} safetensors shard(s)...", paths.len());
             let vb = unsafe { VarBuilder::from_mmaped_safetensors(&paths, dtype, &device)? };
             Backend::Official(Official {
-                text: crate::qwen3_vl_text::Qwen3VLTextEncoder::new(&cfg.text_config, vb.clone())?,
+                text: if streamed {
+                    crate::qwen3_vl_text::Qwen3VLTextEncoder::new_streamed(&cfg.text_config, vb.clone())?
+                } else {
+                    crate::qwen3_vl_text::Qwen3VLTextEncoder::new(&cfg.text_config, vb.clone())?
+                },
                 vision: crate::qwen3_vl_vision::Qwen3VLVisionModel::new(&vision_cfg, vb.pp("model").pp("visual"))?,
                 image_token_id,
                 spatial_merge_size: vision_cfg.spatial_merge_size,

@@ -71,8 +71,8 @@ struct Args {
     precision: Precision,
 
     /// Run the text encoder (and vision tower) on the CPU in F32 instead of the
-    /// GPU: removes its ~34 GB F32 / ~17 GB BF16 from GPU memory at the cost of
-    /// slower prompt encoding.
+    /// GPU. On the GPU its layers are already streamed (~4 GB BF16 / ~6 GB F32
+    /// peak), so this only helps when even that does not fit; ~15x slower.
     #[arg(long)]
     text_encoder_cpu: bool,
 
@@ -168,7 +168,14 @@ fn encode_prompt(
         Some(path) => {
             eprintln!("  Loading text encoder from: {} ({:?} on {:?})", path, encoder_dtype, encoder_device);
             // Dropped when this scope ends.
-            let mut encoder = qwen3_image21::text_encoder::TextEncoder::load(path, 4096, encoder_device.clone(), encoder_dtype)?;
+            // On a GPU the language-model layers are streamed in one at a time:
+            // same speed (loading dominates either way) and bit-identical output,
+            // at ~4 GB of GPU memory instead of ~17 GB (BF16) / ~34 GB (F32).
+            let mut encoder = if !encoder_device.is_cpu() {
+                qwen3_image21::text_encoder::TextEncoder::load_streamed(path, 4096, encoder_device.clone(), encoder_dtype)?
+            } else {
+                qwen3_image21::text_encoder::TextEncoder::load(path, 4096, encoder_device.clone(), encoder_dtype)?
+            };
             let mut encode = |p: &str| -> Result<PromptEmbeds> {
                 let (embeds, image_slots) = if images.is_empty() {
                     (encoder.encode(p)?, None)
