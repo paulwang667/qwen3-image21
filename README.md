@@ -164,7 +164,7 @@ Image-conditioned generation at 1024×1024 (one 1024² condition image, 20 steps
 
 This table predates the prefix-only cache fill (see [Memory](#memory)), which trimmed a further 1–5 s: with it, Q4_K_M `--flash-attn` takes 21 s, full BF16 `--flash-attn` 20 s, full F32 71 s, and the two-reference case 23 s.
 
-Without flash attention, attention is computed in chunks of 1,024 query rows so the score matrix never has to fit at once. Flash attention accuracy vs. the golden tensors (cached step): F32 mean relative error 4.3e-4 (4.1e-4 without it; both dominated by the BF16 KV cache), BF16 7.5e-3 (8.3e-3 without). Output images differ from the non-flash runs by a mean 0.02 (F32) to 0.4 (Q4_K_M) on a 0–255 scale; the two-reference poster differs by 4.9 — same composition and lettering, with small drift in fine detail (leaf edges, brush strokes) accumulated over the 20 steps.
+Without flash attention, attention is computed in query chunks sized so each score block stays near 256 MB, so the score matrix never has to fit at once. Flash attention accuracy vs. the golden tensors (cached step): F32 mean relative error 4.3e-4 (4.1e-4 without it; both dominated by the BF16 KV cache), BF16 7.5e-3 (8.3e-3 without). Output images differ from the non-flash runs by a mean 0.02 (F32) to 0.4 (Q4_K_M) on a 0–255 scale; the two-reference poster differs by 4.9 — same composition and lettering, with small drift in fine detail (leaf edges, brush strokes) accumulated over the 20 steps.
 
 ### Memory
 
@@ -178,15 +178,15 @@ Peak GPU memory (sampled with `nvidia-smi` every 100 ms), 1024² image-condition
 
 | Configuration | Peak (GiB) | Text encoding | Denoising | Wall |
 |---|---|---|---|---|
-| Q4_K_M + `--flash-attn` | **9.2** | 6 s | 21 s | 32 s |
-| Q4_K_M + `--flash-attn` + `--precision bf16` | 9.2 | 5 s | 23 s | 34 s |
-| Q4_K_M + `--precision bf16` (no flash attention) | 10.5 | 5 s | 42 s | 52 s |
-| Full, `--precision bf16` + `--flash-attn` | 18.4 | 5 s | 20 s | 32 s |
-| Full, F32 (default) | 34.1 | 6 s | 71 s | 85 s |
-| Q4_K_M + `--flash-attn` + `--precision bf16`, two 1024² references, 768×1024 output | 14.4 | 7 s | 23 s | 36 s |
+| Q4_K_M + `--flash-attn` | **8.7** | 6 s | 21 s | 33 s |
+| Q4_K_M + `--precision bf16` (no flash attention) | 9.2 | 5 s | 48 s | 58 s |
+| Full, `--precision bf16` + `--flash-attn` | 17.6 | 5 s | 20 s | 32 s |
+| Full, F32 (default) | 32.7 | 6 s | 78 s | 91 s |
+| Q4_K_M + `--flash-attn`, two 1024² references, 768×1024 output | 11.9 | 7 s | 24 s | 36 s |
+| Same, with `--output-resolution 768` (references at 768²) | **9.3** | 5 s | 17 s | 27 s |
 
-- **For a 12 GB GPU**: Q4_K_M with `--flash-attn` (single reference or text-to-image). The text encoder no longer needs BF16 or the CPU to fit; `--text-encoder-cpu` is only a fallback.
-- The peak is now the transformer phase: Q4_K_M weights (~4.2 GB), the prefix KV cache (~2.2 GB per 1024² reference), and activations. Without flash attention the chunked attention's score blocks add ~1.3 GiB; with two references the prefix pass over ~8.3k tokens is the peak.
+- **For a 12 GB GPU**: Q4_K_M with `--flash-attn`. That covers text-to-image and single-reference edits at 1024²; for two references add `--output-resolution 768`, since two 1024² references (11.9 GiB) exceed a 12 GB card's usable ~11.2 GiB. Without flash attention (older GPUs, or builds without `--features flash-attn`) a single-reference edit peaks at 9.2 GiB. The text encoder needs neither BF16 nor the CPU to fit; `--text-encoder-cpu` is only a fallback.
+- The peak is the transformer phase: Q4_K_M weights (~4.2 GB), the prefix KV cache (~2.2 GB per 1024² reference, stored in BF16), and activations. Attention score blocks (~256 MB per query chunk) and MLP intermediates (2,048 tokens at a time) are bounded; the smaller attention chunks cost ~10–15% of denoising time without flash attention.
 - The prefix KV cache is always stored in BF16 (cast back to the compute dtype when attended to): for the two-reference poster above it is ~4.4 GB instead of ~8.7 GB, lowering that run's peak from 26.2 to 20.1 GiB at the time. Cached vs. uncached step (`kv_cache_probe`, 512²): cosine 0.999997 for full precision, 0.9997 for Q4_K_M; the poster rendered with the same seed differs from the F32-cache version by a mean 1.4/255, with no visible difference.
 - BF16 accuracy vs. the F32 golden tensors (cosine): transformer 0.99996, text encoder 0.995, vision tower 0.996. The latents stay F32 across denoising steps and attention softmax runs in F32. In the runs above the output images differ from the F32 run by a mean 0.3 (BF16) and 1.3–1.4 (Q4_K_M) on a 0–255 scale, with no visible difference.
 
@@ -234,7 +234,7 @@ cargo test    # unit tests (RoPE vs. reference formula, dup_up3d, scheduler, att
 - Condition images are resized with the `image` crate's Lanczos3, close to but not bit-identical with upstream's PIL resize.
 - `--precision bf16` has been verified (see [Memory](#memory)); `f16` is untested.
 - End-to-end quality has been verified on CUDA only. The CPU path was checked at the single-forward level (quantized on CPU matches full precision); Metal has not been re-verified since the correctness fixes.
-- Flash attention is opt-in and CUDA-only; the first denoising step (block-causal mask) always uses the chunked path, which materialises scores one 1,024-row chunk at a time.
+- Flash attention is opt-in and CUDA-only; the prefix pass that fills the KV cache (block-causal mask) always uses the chunked path, which materialises scores one ~256 MB chunk at a time.
 
 ## License
 

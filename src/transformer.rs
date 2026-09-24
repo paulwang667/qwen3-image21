@@ -177,11 +177,31 @@ impl Attention {
     
 }
 
-/// Query rows per attention chunk. Image-conditioned sequences reach ~8k
-/// tokens at 1024², where one full `[1, 32, S, S]` F32 score matrix is ~8.6 GB;
-/// chunking the queries keeps each materialised block near 1 GB. Every query
-/// row is computed exactly as without chunking.
-const ATTENTION_CHUNK_ROWS: usize = 1024;
+/// Budget for one query chunk's F32 score block `[B, H, rows, Skv]`.
+/// Image-conditioned sequences reach ~12k keys, where one full `[1, 32, S, S]`
+/// score matrix would take many GB; the chunk's row count is chosen so each
+/// block (and its softmax copy) stays near this size. Every query row is
+/// computed exactly as without chunking.
+const ATTENTION_SCORE_BUDGET_BYTES: usize = 256 << 20;
+
+/// Tokens per MLP chunk: the SwiGLU intermediates are 3x (6x for a fused
+/// gate_up) the hidden width, ~0.8 GB per F32 tensor for an 8k-token prefix.
+/// Rows are independent, so chunking is exact.
+const MLP_CHUNK_TOKENS: usize = 2048;
+
+/// `f` applied to `x` `[B, S, D]` in chunks of `MLP_CHUNK_TOKENS` along `S`,
+/// for a row-wise `f`.
+pub(crate) fn in_token_chunks(x: &Tensor, f: impl Fn(&Tensor) -> Result<Tensor>) -> Result<Tensor> {
+    let seq = x.dim(1)?;
+    if seq <= MLP_CHUNK_TOKENS {
+        return f(x);
+    }
+    let outs = (0..seq)
+        .step_by(MLP_CHUNK_TOKENS)
+        .map(|s| f(&x.narrow(1, s, MLP_CHUNK_TOKENS.min(seq - s))?.contiguous()?))
+        .collect::<Result<Vec<_>>>()?;
+    Tensor::cat(&outs, 1)
+}
 
 static FLASH_ATTENTION: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 
@@ -218,13 +238,14 @@ pub(crate) fn chunked_attention(q: &Tensor, k: &Tensor, v: &Tensor, scale: f64, 
     if mask.is_none() && FLASH_ATTENTION.load(std::sync::atomic::Ordering::Relaxed) && q.device().is_cuda() {
         return flash_attention(q, k, v, scale);
     }
-    let sq = q.dim(2)?;
+    let (b, heads, sq, _) = q.dims4()?;
+    let rows = (ATTENTION_SCORE_BUDGET_BYTES / (b * heads * k.dim(2)? * 4)).clamp(1, sq);
     // Scale q (head_dim wide) rather than the scores (key-length wide).
     let q = q.affine(scale, 0.0)?;
     let kt = k.transpose(2, 3)?.contiguous()?;
-    let mut outs = Vec::with_capacity(sq.div_ceil(ATTENTION_CHUNK_ROWS));
-    for start in (0..sq).step_by(ATTENTION_CHUNK_ROWS) {
-        let len = ATTENTION_CHUNK_ROWS.min(sq - start);
+    let mut outs = Vec::with_capacity(sq.div_ceil(rows));
+    for start in (0..sq).step_by(rows) {
+        let len = rows.min(sq - start);
         let q_chunk = q.narrow(2, start, len)?.contiguous()?;
         let mut w = q_chunk.matmul(&kt)?;
         if let Some(mask) = mask {
@@ -272,10 +293,12 @@ impl GatedMlp {
     }
     
     fn forward(&self, x: &Tensor) -> Result<Tensor> {
-        let proj = x.apply(&self.proj)?;
-        let gate = x.apply(&self.gate_layer)?;
-        let gated = gate.silu()?.broadcast_mul(&proj)?;
-        gated.apply(&self.out)
+        in_token_chunks(x, |x| {
+            let proj = x.apply(&self.proj)?;
+            let gate = x.apply(&self.gate_layer)?;
+            let gated = gate.silu()?.broadcast_mul(&proj)?;
+            gated.apply(&self.out)
+        })
     }
 }
 

@@ -170,16 +170,18 @@ impl GatedMlp {
     }
 
     fn forward(&self, x: &Tensor) -> Result<Tensor> {
-        let (gate, proj) = match &self.input {
-            MlpInput::Separate { proj, gate_layer } => (x.apply(gate_layer)?, x.apply(proj)?),
-            MlpInput::FusedGateUp(gate_up) => {
-                let gu = x.apply(gate_up)?;
-                let half = gu.dim(D::Minus1)? / 2;
-                (gu.narrow(D::Minus1, 0, half)?, gu.narrow(D::Minus1, half, half)?)
-            }
-        };
-        let gated = gate.silu()?.broadcast_mul(&proj)?;
-        gated.apply(&self.out)
+        crate::transformer::in_token_chunks(x, |x| {
+            let (gate, proj) = match &self.input {
+                MlpInput::Separate { proj, gate_layer } => (x.apply(gate_layer)?, x.apply(proj)?),
+                MlpInput::FusedGateUp(gate_up) => {
+                    let gu = x.apply(gate_up)?;
+                    let half = gu.dim(D::Minus1)? / 2;
+                    (gu.narrow(D::Minus1, 0, half)?, gu.narrow(D::Minus1, half, half)?)
+                }
+            };
+            let gated = gate.silu()?.broadcast_mul(&proj)?;
+            gated.apply(&self.out)
+        })
     }
 }
 
