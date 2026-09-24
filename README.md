@@ -105,7 +105,7 @@ Two 1024×1024 references combined into a 768×1024 poster with Chinese calligra
   --output poster.png
 ```
 
-The teacup keeps reference 1's blue floral pattern, gold rim, and saucer; the apple matches reference 2; both lines of Chinese text render without errors. Each 1024² reference adds 1,024 image tokens to the prompt (2,165 prompt tokens here) and 4,096 latent tokens to the transformer, so this run's sequence is 117 text + 8,192 reference + 3,072 target ≈ 11,400 tokens, and its prefix KV cache is ~8.7 GB in F32. A GGUF transformer was used because full-precision F32 already peaks at ~41 GiB with one reference, and the second adds ~4.4 GB of cache, which likely exceeds a 46 GB GPU (an estimate, not a measurement; `--precision bf16` would halve the weights).
+The teacup keeps reference 1's blue floral pattern, gold rim, and saucer; the apple matches reference 2; both lines of Chinese text render without errors. Each 1024² reference adds 1,024 image tokens to the prompt (2,165 prompt tokens here) and 4,096 latent tokens to the transformer, so this run's sequence is 117 text + 8,192 reference + 3,072 target ≈ 11,400 tokens, and its prefix KV cache is ~4.4 GB (stored in BF16). With `--precision bf16` added (BF16 text encoder), this poster peaks at 20.1 GiB on the GPU.
 
 ### Options
 
@@ -153,15 +153,16 @@ Peak GPU memory (sampled with `nvidia-smi` every 100 ms), 1024² image-condition
 
 | Transformer | Text encoder | Peak (GiB) | Text encoding | Denoising | Wall |
 |---|---|---|---|---|---|
-| Full, F32 (default) | GPU, F32 | 41.3 | 6 s | 136 s | 151 s |
+| Full, F32 (default) | GPU, F32 | 39.4 | 6 s | 136 s | 151 s |
 | Full, `--precision bf16` | GPU, BF16 | 24.0 | 5 s | 106 s | 119 s |
 | Full, `--precision bf16` | `--text-encoder-cpu` | 23.9 | 81 s | 106 s | 194 s |
 | Q4_K_M | GPU, F32 (default) | 35.0 | 6 s | 102 s | 115 s |
 | Q4_K_M, `--precision bf16` | GPU, BF16 | 18.8 | 5 s | 101 s | — |
-| Q4_K_M | `--text-encoder-cpu` | 16.9 | 79 s | 101 s | 187 s |
+| Q4_K_M | `--text-encoder-cpu` | 14.9 | 79 s | 101 s | 186 s |
 
 - With a GGUF transformer, `--precision bf16` only changes the text encoder. **Q4_K_M + `--precision bf16`** is the practical low-memory setting: under 19 GiB at full speed.
 - The peak is whichever phase is largest: the text encoder (~34 GB F32 / ~17 GB BF16 of weights) or the transformer phase (weights, activations, and the prefix KV cache, which grows with the number of condition images).
+- The prefix KV cache is always stored in BF16 (cast back to the compute dtype when attended to): for the two-reference poster above it is ~4.4 GB instead of ~8.7 GB, lowering that run's peak from 26.2 to 20.1 GiB. Cached vs. uncached step (`kv_cache_probe`, 512²): cosine 0.999997 for full precision, 0.9997 for Q4_K_M; the poster rendered with the same seed differs from the F32-cache version by a mean 1.4/255, with no visible difference.
 - BF16 accuracy vs. the F32 golden tensors (cosine): transformer 0.99996, text encoder 0.995, vision tower 0.996. The latents stay F32 across denoising steps and attention softmax runs in F32. In the runs above the output images differ from the F32 run by a mean 0.3 (BF16) and 1.3–1.4 (Q4_K_M) on a 0–255 scale, with no visible difference.
 
 ## Project layout

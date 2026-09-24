@@ -125,7 +125,7 @@ impl Attention {
         let k = apply_rope(&k, pe)?;
         eprintln!("  [Attention] after rope k.shape={:?}", k.shape());
         let (k_all, v_all) = match prefix {
-            Some((pk, pv)) => (Tensor::cat(&[pk, &k], 2)?, Tensor::cat(&[pv, &v], 2)?),
+            Some((pk, pv)) => (Tensor::cat(&[&pk.to_dtype(k.dtype())?, &k], 2)?, Tensor::cat(&[&pv.to_dtype(v.dtype())?, &v], 2)?),
             None => (k.clone(), v.clone()),
         };
 
@@ -467,7 +467,7 @@ impl QwenImageTransformerQuantized {
             let prefix = cached.as_ref().map(|c| &c.layers[i]);
             let (out, k, v) = block.forward(&h, &modulation, &pe, attention_mask.as_ref(), prefix)?;
             if extract {
-                extracted.push((k.narrow(2, 0, prefix_len)?.contiguous()?, v.narrow(2, 0, prefix_len)?.contiguous()?));
+                extracted.push((k.narrow(2, 0, prefix_len)?.to_dtype(crate::transformer::KV_CACHE_DTYPE)?, v.narrow(2, 0, prefix_len)?.to_dtype(crate::transformer::KV_CACHE_DTYPE)?));
             }
             h = out;
         }

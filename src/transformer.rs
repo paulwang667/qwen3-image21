@@ -13,9 +13,15 @@ use super::scheduler::TimeEmbedding;
 /// the image tokens, attending to `[cached text K/V ; image K/V]`.
 #[derive(Debug, Clone)]
 pub struct TextKvCache {
-    /// One `(k, v)` per block, each `[batch, heads, text_len, head_dim]`.
+    /// One `(k, v)` per block, each `[batch, heads, text_len, head_dim]`, stored
+    /// as [`KV_CACHE_DTYPE`].
     pub(crate) layers: Vec<(Tensor, Tensor)>,
 }
+
+/// Storage dtype of [`TextKvCache`]: with condition images the prefix reaches
+/// ~11k tokens, whose F32 K/V over 32 layers take ~8.7 GB. Cached entries are
+/// cast back to the compute dtype when attended to.
+pub(crate) const KV_CACHE_DTYPE: DType = DType::BF16;
 
 /// Qwen-Image-2.1 Transformer config (32 Single-Stream DiT layers).
 #[derive(Debug, Clone)]
@@ -160,7 +166,7 @@ impl Attention {
         let q = apply_rope(&q, pe)?;
         let k = apply_rope(&k, pe)?;
         let (k_all, v_all) = match prefix {
-            Some((pk, pv)) => (Tensor::cat(&[pk, &k], 2)?, Tensor::cat(&[pv, &v], 2)?),
+            Some((pk, pv)) => (Tensor::cat(&[&pk.to_dtype(k.dtype())?, &k], 2)?, Tensor::cat(&[&pv.to_dtype(v.dtype())?, &v], 2)?),
             None => (k.clone(), v.clone()),
         };
         let attn_out = chunked_attention(&q, &k_all, &v_all, (self.dim_head as f64).powf(-0.5), attention_mask)?;
@@ -585,7 +591,7 @@ impl QwenImageTransformer {
             let prefix = cached.as_ref().map(|c| &c.layers[i]);
             let (h, k, v) = block.forward(&hidden_states, &modulation, &pe, attention_mask.as_ref(), prefix)?;
             if extract {
-                extracted.push((k.narrow(2, 0, prefix_len)?.contiguous()?, v.narrow(2, 0, prefix_len)?.contiguous()?));
+                extracted.push((k.narrow(2, 0, prefix_len)?.to_dtype(KV_CACHE_DTYPE)?, v.narrow(2, 0, prefix_len)?.to_dtype(KV_CACHE_DTYPE)?));
             }
             hidden_states = h;
         }
