@@ -43,6 +43,12 @@ cargo build --release                    # CPU only
 
 At runtime the binary tries CUDA, then Metal, then falls back to CPU.
 
+Optional FlashAttention v2 (NVIDIA sm80+, e.g. A100 / RTX 30xx / L20 and newer), used with `--flash-attn`. It compiles the flash-attn CUDA kernels with `nvcc` (9 minutes on a 44-core machine):
+
+```bash
+PATH=/usr/local/cuda/bin:$PATH CUDA_COMPUTE_CAP=89 cargo build --release --features flash-attn
+```
+
 ## Usage
 
 Quantized (GGUF) transformer:
@@ -125,6 +131,7 @@ The teacup keeps reference 1's blue floral pattern, gold rim, and saucer; the ap
 | `--no-kv-cache` | off | Recompute the text prefix every step (for A/B checks). |
 | `--precision` | `f32` | `bf16` halves the memory of the full-precision transformer and of the GPU text encoder (see [Memory](#memory)). GGUF transformers and the VAE always compute in F32. `f16` is untested. |
 | `--text-encoder-cpu` | off | Run the text encoder and vision tower on the CPU in F32: frees their GPU memory but adds ~75 s of prompt encoding. |
+| `--flash-attn` | off | FlashAttention v2 for the unmasked attention of every step after the first (with the KV cache); the first step's block-causal mask still takes the chunked path. Needs a `--features flash-attn` build. F32 inputs are cast to F16 for the kernel. |
 | `--tf32` | off | Allow TF32 tensor cores for F32 matmuls on CUDA: full-precision F32 denoising 84 → 60 s at ~2e-4 relative error (BF16 is ~9e-3). No effect on GGUF linear layers or BF16. |
 | `--benchmark`, `--benchmark-iterations` | off, `3` | Keeps transformer + VAE loaded and times repeated runs. |
 | `--seed` | random | Printed at startup; pass it again to reproduce a run. Noise is drawn on the host, so a seed gives the same noise on every device. |
@@ -145,7 +152,17 @@ NVIDIA L20 (46 GB), 1024×1024, 20 steps, denoising time only:
 - Attention uses candle's fused last-dim softmax. The generic `softmax` (five full passes over the score matrix) took over half of all GPU kernel time in an `nsys` profile; switching roughly halved denoising time for the quantized paths.
 - Accuracy vs. full precision (one forward pass, cosine similarity): Q8_0 0.99986, Q4_K_M 0.99537. Neither shows a visible quality difference.
 
-Image-conditioned generation at 1024×1024 (one 1024² condition image, 20 steps) roughly doubles the sequence to ~8,200 tokens: full precision 84 s (F32) / 60 s (`--tf32`) / 57 s (`--precision bf16`), Q4_K_M 49 s. With two 1024² references and a 768×1024 output (~11,400 tokens), Q4_K_M takes 61 s. Attention is computed in chunks of 1,024 query rows so the score matrix never has to fit at once.
+Image-conditioned generation at 1024×1024 (one 1024² condition image, 20 steps) roughly doubles the sequence to ~8,200 tokens. Denoising time:
+
+| Transformer | Default | `--flash-attn` |
+|---|---|---|
+| Full, F32 | 84 s | 58 s |
+| Full, F32 + `--tf32` | 60 s | 41 s |
+| Full, `--precision bf16` | 57 s | 29 s |
+| Q4_K_M (+ `--precision bf16` text encoder) | 49 s | 29 s |
+| Q4_K_M, two 1024² references, 768×1024 output (~11,400 tokens) | 61 s | 32 s |
+
+Without flash attention, attention is computed in chunks of 1,024 query rows so the score matrix never has to fit at once. Flash attention accuracy vs. the golden tensors (cached step): F32 mean relative error 4.3e-4 (4.1e-4 without it; both dominated by the BF16 KV cache), BF16 7.5e-3 (8.3e-3 without). Output images differ from the non-flash runs by a mean 0.02 (F32) to 0.4 (Q4_K_M) on a 0–255 scale; the two-reference poster differs by 4.9 — same composition and lettering, with small drift in fine detail (leaf edges, brush strokes) accumulated over the 20 steps.
 
 ### Memory
 
@@ -211,7 +228,7 @@ cargo test    # unit tests (RoPE vs. reference formula, dup_up3d, scheduler, att
 - Condition images are resized with the `image` crate's Lanczos3, close to but not bit-identical with upstream's PIL resize.
 - `--precision bf16` has been verified (see [Memory](#memory)); `f16` is untested.
 - End-to-end quality has been verified on CUDA only. The CPU path was checked at the single-forward level (quantized on CPU matches full precision); Metal has not been re-verified since the correctness fixes.
-- No flash attention: attention scores are materialised one 1,024-row chunk at a time.
+- Flash attention is opt-in and CUDA-only; the first denoising step (block-causal mask) always uses the chunked path, which materialises scores one 1,024-row chunk at a time.
 
 ## License
 

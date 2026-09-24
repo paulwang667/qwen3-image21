@@ -186,10 +186,41 @@ impl Attention {
 /// row is computed exactly as without chunking.
 const ATTENTION_CHUNK_ROWS: usize = 1024;
 
+static FLASH_ATTENTION: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// Route unmasked attention (every step after the first with the prefix KV
+/// cache) through FlashAttention v2. Masked attention always takes the chunked
+/// path: FA2 has no arbitrary-mask entry point.
+pub fn set_flash_attention(enabled: bool) -> Result<()> {
+    if enabled && !cfg!(feature = "flash-attn") {
+        candle_core::bail!("flash attention needs a build with `--features flash-attn`");
+    }
+    FLASH_ATTENTION.store(enabled, std::sync::atomic::Ordering::Relaxed);
+    Ok(())
+}
+
+/// FlashAttention has no F32 kernels; F32 inputs are cast to this for the call.
+#[cfg(feature = "flash-attn")]
+const FLASH_F32_AS: DType = DType::F16;
+
+/// FlashAttention v2 on `[B, H, S, D]` inputs (it takes `[B, S, H, D]`).
+#[cfg(feature = "flash-attn")]
+fn flash_attention(q: &Tensor, k: &Tensor, v: &Tensor, scale: f64) -> Result<Tensor> {
+    let dtype = q.dtype();
+    let half = if dtype == DType::F32 { FLASH_F32_AS } else { dtype };
+    let prep = |x: &Tensor| x.transpose(1, 2)?.to_dtype(half)?.contiguous();
+    let out = candle_flash_attn::flash_attn(&prep(q)?, &prep(k)?, &prep(v)?, scale as f32, false)?;
+    out.transpose(1, 2)?.to_dtype(dtype)
+}
+
 /// `softmax(q kᵀ · scale + mask) v` for `q` `[B, H, Sq, D]` and `k`/`v`
 /// `[B, H, Skv, D]`. `mask` is a bool/u8 `[B, 1, Sq, Skv]` (or `[B, 1, 1, Skv]`)
 /// tensor, true where attending is allowed.
 pub(crate) fn chunked_attention(q: &Tensor, k: &Tensor, v: &Tensor, scale: f64, mask: Option<&Tensor>) -> Result<Tensor> {
+    #[cfg(feature = "flash-attn")]
+    if mask.is_none() && FLASH_ATTENTION.load(std::sync::atomic::Ordering::Relaxed) && q.device().is_cuda() {
+        return flash_attention(q, k, v, scale);
+    }
     let sq = q.dim(2)?;
     // Scale q (head_dim wide) rather than the scores (key-length wide).
     let q = q.affine(scale, 0.0)?;

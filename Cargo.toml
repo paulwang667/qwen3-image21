@@ -17,6 +17,7 @@ image = "0.25"
 tokenizers = "0.21"
 rand = "0.9"
 rand_distr = "0.5"
+candle-flash-attn = { version = "0.11", optional = true }
 
 [features]
 default = []
@@ -25,3 +26,6 @@ default = []
 # neither runs on CPU only.
 metal = ["candle-core/metal", "candle-nn/metal", "candle-transformers/metal"]
 cuda = ["candle-core/cuda", "candle-nn/cuda", "candle-transformers/cuda"]
+# FlashAttention v2 for unmasked attention (`--flash-attn`). CUDA only, sm80+;
+# compiles the flash-attn kernels with nvcc (slow first build).
+flash-attn = ["cuda", "dep:candle-flash-attn"]

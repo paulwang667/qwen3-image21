@@ -83,6 +83,12 @@ struct Args {
     #[arg(long)]
     tf32: bool,
 
+    /// Use FlashAttention v2 for unmasked attention (all steps after the first
+    /// with the KV cache). Needs a build with `--features flash-attn`; F32
+    /// inputs are cast to F16 for the kernel.
+    #[arg(long)]
+    flash_attn: bool,
+
     /// Run benchmark mode (multiple iterations)
     #[arg(long)]
     benchmark: bool,
@@ -262,6 +268,7 @@ fn main() -> Result<()> {
     };
     let dtype = args.precision.as_dtype();
     candle_core::cuda::set_gemm_reduced_precision_f32(args.tf32);
+    qwen3_image21::transformer::set_flash_attention(args.flash_attn)?;
 
     eprintln!("Device: {:?}", device);
     eprintln!("Prompt: {}", args.prompt);

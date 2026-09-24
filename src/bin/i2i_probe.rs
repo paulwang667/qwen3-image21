@@ -76,6 +76,8 @@ fn main() -> Result<()> {
     };
     // I2I_TF32=1 allows TF32 for F32 matmuls (the CLI's --tf32).
     candle_core::cuda::set_gemm_reduced_precision_f32(std::env::var("I2I_TF32").as_deref() == Ok("1"));
+    // I2I_FLASH=1 routes unmasked attention through FlashAttention (--flash-attn).
+    qwen3_image21::transformer::set_flash_attention(std::env::var("I2I_FLASH").as_deref() == Ok("1"))?;
 
     match stage {
         "vae" => {
