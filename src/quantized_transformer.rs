@@ -1,6 +1,6 @@
 use candle_core::{Module, Result, Tensor, D, DType, Device};
 use candle_nn::{LayerNorm, RmsNorm};
-use candle_transformers::quantized_nn::{self as qnn, Linear};
+use candle_core::quantized::QMatMul;
 use candle_transformers::quantized_var_builder::VarBuilder;
 use crate::rope::{apply_rope, EmbedNd};
 use crate::scheduler::timestep_embedding;
@@ -11,6 +11,27 @@ use crate::transformer::TextKvCache;
 /// Qwen-Image-2.1 config - same as non-quantized.
 pub use crate::transformer::Config;
 
+/// A bias-free GGUF linear layer that accepts F32 or BF16 activations.
+/// Quantized weights go through candle's quantized matmul, which takes either;
+/// the few weights a GGUF stores unquantized (`img_in`, `txt_in`,
+/// `norm_out.linear` in unsloth's files) become plain F32 tensors, so other
+/// activation dtypes are cast to F32 around them.
+#[derive(Debug, Clone)]
+struct Linear(QMatMul);
+
+impl Module for Linear {
+    fn forward(&self, x: &Tensor) -> Result<Tensor> {
+        match &self.0 {
+            QMatMul::Tensor(w) if w.dtype() != x.dtype() => x.to_dtype(w.dtype())?.apply(&self.0)?.to_dtype(x.dtype()),
+            m => x.apply(m),
+        }
+    }
+}
+
+fn linear(in_dim: usize, out_dim: usize, vb: VarBuilder) -> Result<Linear> {
+    Ok(Linear(QMatMul::from_arc(vb.get((out_dim, in_dim), "weight")?)?))
+}
+
 /// Quantized timestep embedding (linear_1 -> silu -> linear_2).
 #[derive(Debug, Clone)]
 struct QwenTimestepEmbedder {
@@ -20,8 +41,8 @@ struct QwenTimestepEmbedder {
 
 impl QwenTimestepEmbedder {
     fn new(cfg: &Config, vb: VarBuilder) -> Result<Self> {
-        let linear_1 = qnn::linear_b(256, cfg.hidden_size(), false, vb.pp("linear_1"))?;
-        let linear_2 = qnn::linear_b(cfg.hidden_size(), cfg.hidden_size(), false, vb.pp("linear_2"))?;
+        let linear_1 = linear(256, cfg.hidden_size(), vb.pp("linear_1"))?;
+        let linear_2 = linear(cfg.hidden_size(), cfg.hidden_size(), vb.pp("linear_2"))?;
         Ok(Self { linear_1, linear_2 })
     }
 
@@ -42,12 +63,12 @@ struct QTextEmbedder {
 }
 
 impl QTextEmbedder {
-    fn new(cfg: &Config, vb: VarBuilder) -> Result<Self> {
+    fn new(cfg: &Config, vb: VarBuilder, dtype: DType) -> Result<Self> {
         // ZeroCenterRMSNorm: the checkpoint stores `scale - 1`, so add 1 back.
-        let text_norm_weight = (vb.get(cfg.hidden_size(), "text_norm.weight")?.dequantize(vb.device())? + 1.0)?;
+        let text_norm_weight = (vb.get(cfg.hidden_size(), "text_norm.weight")?.dequantize(vb.device())? + 1.0)?.to_dtype(dtype)?;
         let text_norm = RmsNorm::new(text_norm_weight, 1e-6);
-        let in_layer = qnn::linear_b(cfg.joint_attention_dim, cfg.hidden_size(), false, vb.pp("in_layer"))?;
-        let out_layer = qnn::linear_b(cfg.hidden_size(), cfg.hidden_size(), false, vb.pp("out_layer"))?;
+        let in_layer = linear(cfg.joint_attention_dim, cfg.hidden_size(), vb.pp("in_layer"))?;
+        let out_layer = linear(cfg.hidden_size(), cfg.hidden_size(), vb.pp("out_layer"))?;
         Ok(Self { text_norm, in_layer, out_layer })
     }
 
@@ -75,18 +96,18 @@ pub struct Attention {
 }
 
 impl Attention {
-    fn new(cfg: &Config, vb: VarBuilder) -> Result<Self> {
+    fn new(cfg: &Config, vb: VarBuilder, dtype: DType) -> Result<Self> {
         let h_sz = cfg.hidden_size();
         let d_head = cfg.attention_head_dim;
 
-        let to_q = qnn::linear_b(cfg.hidden_size(), h_sz, false, vb.pp("to_q"))?;
-        let to_k = qnn::linear_b(cfg.hidden_size(), h_sz, false, vb.pp("to_k"))?;
-        let to_v = qnn::linear_b(cfg.hidden_size(), h_sz, false, vb.pp("to_v"))?;
-        let to_out = qnn::linear_b(h_sz, cfg.hidden_size(), false, vb.pp("to_out.0"))?;
+        let to_q = linear(cfg.hidden_size(), h_sz, vb.pp("to_q"))?;
+        let to_k = linear(cfg.hidden_size(), h_sz, vb.pp("to_k"))?;
+        let to_v = linear(cfg.hidden_size(), h_sz, vb.pp("to_v"))?;
+        let to_out = linear(h_sz, cfg.hidden_size(), vb.pp("to_out.0"))?;
 
-        let norm_q_w = vb.get(d_head, "norm_q.weight")?.dequantize(vb.device())?;
+        let norm_q_w = vb.get(d_head, "norm_q.weight")?.dequantize(vb.device())?.to_dtype(dtype)?;
         let norm_q = RmsNorm::new(norm_q_w, 1e-6);
-        let norm_k_w = vb.get(d_head, "norm_k.weight")?.dequantize(vb.device())?;
+        let norm_k_w = vb.get(d_head, "norm_k.weight")?.dequantize(vb.device())?.to_dtype(dtype)?;
         let norm_k = RmsNorm::new(norm_k_w, 1e-6);
 
         Ok(Self {
@@ -157,14 +178,14 @@ impl GatedMlp {
 
         // Not `contains_key`: candle's quantized VarBuilder ignores the `pp` prefix there.
         let input = if vb.get_no_shape("gate_up.weight").is_ok() {
-            MlpInput::FusedGateUp(qnn::linear_b(hidden, 2 * mlp_hidden, false, vb.pp("gate_up"))?)
+            MlpInput::FusedGateUp(linear(hidden, 2 * mlp_hidden, vb.pp("gate_up"))?)
         } else {
             MlpInput::Separate {
-                proj: qnn::linear_b(hidden, mlp_hidden, false, vb.pp("proj"))?,
-                gate_layer: qnn::linear_b(hidden, mlp_hidden, false, vb.pp("gate_layer"))?,
+                proj: linear(hidden, mlp_hidden, vb.pp("proj"))?,
+                gate_layer: linear(hidden, mlp_hidden, vb.pp("gate_layer"))?,
             }
         };
-        let out = qnn::linear_b(mlp_hidden, hidden, false, vb.pp("out"))?;
+        let out = linear(mlp_hidden, hidden, vb.pp("out"))?;
 
         Ok(Self { input, out })
     }
@@ -200,7 +221,7 @@ struct Modulation {
 
 impl Modulation {
     fn new(dim: usize, vb: VarBuilder) -> Result<Self> {
-        let lin = qnn::linear_b(dim, 4 * dim, false, vb.pp("1"))?;
+        let lin = linear(dim, 4 * dim, vb.pp("1"))?;
         Ok(Self { lin })
     }
 
@@ -209,11 +230,11 @@ impl Modulation {
     }
 }
 
-fn layer_norm_no_bias(dim: usize, device: &Device) -> Result<LayerNorm> {
+fn layer_norm_no_bias(dim: usize, device: &Device, dtype: DType) -> Result<LayerNorm> {
     // Zero bias so candle takes its fused layer-norm kernel (see
     // `transformer::fixed_layer_norm`); mathematically still bias-free.
-    let ws = Tensor::ones(dim, DType::F32, device)?;
-    let bias = Tensor::zeros(dim, DType::F32, device)?;
+    let ws = Tensor::ones(dim, dtype, device)?;
+    let bias = Tensor::zeros(dim, dtype, device)?;
     Ok(LayerNorm::new(ws, bias, 1e-6))
 }
 
@@ -227,11 +248,11 @@ pub struct TransformerBlock {
 }
 
 impl TransformerBlock {
-    fn new(cfg: &Config, vb: VarBuilder) -> Result<Self> {
+    fn new(cfg: &Config, vb: VarBuilder, dtype: DType) -> Result<Self> {
         let hidden = cfg.hidden_size();
-        let norm1 = layer_norm_no_bias(hidden, vb.device())?;
-        let attn = Attention::new(cfg, vb.pp("attn"))?;
-        let norm2 = layer_norm_no_bias(hidden, vb.device())?;
+        let norm1 = layer_norm_no_bias(hidden, vb.device(), dtype)?;
+        let attn = Attention::new(cfg, vb.pp("attn"), dtype)?;
+        let norm2 = layer_norm_no_bias(hidden, vb.device(), dtype)?;
         let mlp = GatedMlp::new(cfg, vb.pp("img_mlp"))?;
         Ok(Self { norm1, attn, norm2, mlp })
     }
@@ -278,10 +299,10 @@ struct FinalLayer {
 }
 
 impl FinalLayer {
-    fn new(cfg: &Config, vb: VarBuilder) -> Result<Self> {
+    fn new(cfg: &Config, vb: VarBuilder, dtype: DType) -> Result<Self> {
         let hidden = cfg.hidden_size();
-        let norm = layer_norm_no_bias(hidden, vb.device())?;
-        let linear = qnn::linear_b(hidden, hidden, false, vb.pp("linear"))?;
+        let norm = layer_norm_no_bias(hidden, vb.device(), dtype)?;
+        let linear = linear(hidden, hidden, vb.pp("linear"))?;
         Ok(Self { norm, linear })
     }
 
@@ -356,7 +377,7 @@ impl QwenImageTransformerQuantized {
         let cond = condition.map(|c| c.latents.apply(&self.img_in)).transpose()?;
         let x = layout.assemble(&txt, cond.as_ref(), target)?.narrow(1, 0, prefix_len)?.contiguous()?;
         let modulation = self.zero_modulation(x.dtype())?;
-        let pe = self.rope(layout)?.narrow(0, 0, prefix_len)?;
+        let pe = self.rope(layout)?.narrow(0, 0, prefix_len)?.to_dtype(x.dtype())?;
         let key_valid = self
             .key_valid(txt_mask, layout, txt.dim(1)?, seq_img)?
             .map(|kv| kv.narrow(1, 0, prefix_len))
@@ -374,14 +395,21 @@ impl QwenImageTransformerQuantized {
         Ok(TextKvCache { layers })
     }
 
+    /// Computes in F32 (see [`Self::new_with_dtype`]).
     pub fn new(cfg: &Config, vb: VarBuilder) -> Result<Self> {
+        Self::new_with_dtype(cfg, vb, DType::F32)
+    }
+
+    /// Activations (and the norms' weights) in `dtype`, F32 or BF16; the
+    /// quantized weights stay as stored either way.
+    pub fn new_with_dtype(cfg: &Config, vb: VarBuilder, dtype: DType) -> Result<Self> {
         let device = vb.device().clone();
 
-        let img_in = qnn::linear_b(cfg.in_channels, cfg.hidden_size(), false, vb.pp("img_in"))?;
+        let img_in = linear(cfg.in_channels, cfg.hidden_size(), vb.pp("img_in"))?;
 
         // Not `contains_key`: candle's quantized VarBuilder ignores the `pp` prefix there.
         let txt_in = if vb.get_no_shape("txt_in.in_layer.weight").is_ok() {
-            Some(QTextEmbedder::new(cfg, vb.pp("txt_in"))?)
+            Some(QTextEmbedder::new(cfg, vb.pp("txt_in"), dtype)?)
         } else {
             None
         };
@@ -389,13 +417,13 @@ impl QwenImageTransformerQuantized {
         let time_text_embed = QwenTimestepEmbedder::new(cfg, vb.pp("time_text_embed.timestep_embedder"))?;
         let mut transformer_blocks = Vec::with_capacity(cfg.num_layers);
         for i in 0..cfg.num_layers {
-            let block = TransformerBlock::new(cfg, vb.pp(format!("transformer_blocks.{}", i)))?;
+            let block = TransformerBlock::new(cfg, vb.pp(format!("transformer_blocks.{}", i)), dtype)?;
             transformer_blocks.push(block);
         }
 
-        let final_layer = FinalLayer::new(cfg, vb.pp("norm_out"))?;
+        let final_layer = FinalLayer::new(cfg, vb.pp("norm_out"), dtype)?;
         let modulation = Modulation::new(cfg.hidden_size(), vb.pp("modulation"))?;
-        let proj_out = qnn::linear_b(cfg.hidden_size(), cfg.in_channels, false, vb.pp("proj_out"))?;
+        let proj_out = linear(cfg.hidden_size(), cfg.in_channels, vb.pp("proj_out"))?;
 
         Ok(Self {
             img_in, txt_in, time_text_embed, modulation, transformer_blocks,
@@ -497,6 +525,7 @@ impl QwenImageTransformerQuantized {
         // RoPE over the full joint layout; a cached step keeps only the target rows.
         let pe = self.rope(&layout)?;
         let pe = if cached.is_some() { pe.narrow(0, prefix_len, seq_img)?.contiguous()? } else { pe };
+        let pe = pe.to_dtype(x.dtype())?;
 
         let key_valid = self.key_valid(encoder_hidden_states_mask, &layout, seq_txt, seq_img)?;
         let attention_mask = if cached.is_some() {

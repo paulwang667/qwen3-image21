@@ -2,6 +2,7 @@
 //! full-precision safetensors model (CUDA/Metal), the quantized GGUF model on
 //! the same device, and the quantized GGUF model on CPU. Separates a bug in the
 //! quantized forward code from a device-specific quantized-kernel problem.
+//! Also runs the quantized model on the GPU with BF16 activations.
 use anyhow::Result;
 use candle_core::{DType, Device, Tensor};
 use candle_nn::VarBuilder;
@@ -51,16 +52,20 @@ fn main() -> Result<()> {
         run(&model, &inputs, &gpu, size)?
     };
 
-    let load_quantized = |device: &Device| -> Result<TransformerType> {
+    let load_quantized = |device: &Device, dtype: DType| -> Result<TransformerType> {
         let vb = candle_transformers::quantized_var_builder::VarBuilder::from_gguf(&gguf, device)?;
         let vb = if vb.contains_key("model.diffusion_model.img_in.weight") { vb.pp("model.diffusion_model") } else { vb };
-        Ok(TransformerType::Quantized(QwenImageTransformerQuantized::new(&cfg, vb)?))
+        Ok(TransformerType::Quantized(QwenImageTransformerQuantized::new_with_dtype(&cfg, vb, dtype)?))
     };
-    let quant_gpu = run(&load_quantized(&gpu)?, &inputs, &gpu, size)?;
-    let quant_cpu = run(&load_quantized(&cpu)?, &inputs, &cpu, size)?;
+    let quant_gpu = run(&load_quantized(&gpu, DType::F32)?, &inputs, &gpu, size)?;
+    let quant_cpu = run(&load_quantized(&cpu, DType::F32)?, &inputs, &cpu, size)?;
+    let bf16_inputs = [inputs[0].to_dtype(DType::BF16)?, inputs[1].to_dtype(DType::BF16)?, inputs[2].to_dtype(DType::BF16)?];
+    let quant_gpu_bf16 = run(&load_quantized(&gpu, DType::BF16)?, &bf16_inputs, &gpu, size)?.to_dtype(DType::F32)?;
 
     println!("cosine(full, quant@gpu) = {:.6}", cosine(&full, &quant_gpu)?);
     println!("cosine(full, quant@cpu) = {:.6}", cosine(&full, &quant_cpu)?);
     println!("cosine(quant@gpu, quant@cpu) = {:.6}", cosine(&quant_gpu, &quant_cpu)?);
+    println!("cosine(full, quant@gpu bf16) = {:.6}", cosine(&full, &quant_gpu_bf16)?);
+    println!("cosine(quant@gpu, quant@gpu bf16) = {:.6}", cosine(&quant_gpu, &quant_gpu_bf16)?);
     Ok(())
 }
