@@ -235,7 +235,7 @@ impl TransformerBlock {
     }
 
     fn forward(&self, x: &Tensor, modulation: &Tensor, pe: &Tensor, attention_mask: Option<&Tensor>, prefix: Option<&(Tensor, Tensor)>) -> Result<(Tensor, Tensor, Tensor)> {
-        // Per-token modulation [B, seq, 4*hidden] -> [scale1, gate1, scale2, gate2]
+        // Modulation [B, seq or 1, 4*hidden] -> [scale1, gate1, scale2, gate2], broadcast over tokens
         let parts = modulation.chunk(4, D::Minus1)?;
         let scale1 = parts[0].clone();
         let gate1 = parts[1].clone();
@@ -305,28 +305,71 @@ pub struct QwenImageTransformerQuantized {
 }
 
 impl QwenImageTransformerQuantized {
-    /// `causal_condition` modulation `[B, seq_txt + seq_img, 4*hidden]`: text
-    /// tokens read a row computed at t=0, image tokens the real timestep's row.
-    /// See `QwenImageTransformer::forward` for the non-quantized equivalent.
-    fn per_token_modulation(&self, t_emb: &Tensor, seq_txt: usize, seq_img: usize, dtype: DType) -> Result<Tensor> {
-        let batch = t_emb.dim(0)?;
-        let width = 4 * self.cfg.hidden_size();
-        let real = self.modulation.forward(t_emb)?.unsqueeze(1)?.broadcast_as((batch, seq_img, width))?.contiguous()?;
-        if seq_txt == 0 {
-            return Ok(real);
-        }
+    /// `causal_condition`: the prefix (text and condition images) takes a row
+    /// computed at t=0, `[1, 1, 4*hidden]`. See
+    /// `QwenImageTransformer::zero_modulation` for the non-quantized equivalent.
+    fn zero_modulation(&self, dtype: DType) -> Result<Tensor> {
         // t=0 sinusoidal embedding is the constant [cos(0)=1.., sin(0)=0..] (dim 256).
         let zero_sinusoidal = Tensor::cat(
             &[Tensor::ones((1, 128), dtype, &self.device)?, Tensor::zeros((1, 128), dtype, &self.device)?],
             D::Minus1,
         )?;
-        let zero = self
-            .modulation
-            .forward(&self.time_text_embed.forward(&zero_sinusoidal)?)?
-            .unsqueeze(1)?
-            .broadcast_as((batch, seq_txt, width))?
-            .contiguous()?;
-        Tensor::cat(&[&zero, &real], 1)
+        self.modulation.forward(&self.time_text_embed.forward(&zero_sinusoidal)?)?.unsqueeze(1)
+    }
+
+    /// RoPE frequencies over the whole joint layout.
+    fn rope(&self, layout: &JointLayout) -> Result<Tensor> {
+        let image_pad_mask: Vec<u8> = layout.image_pad_mask.iter().map(|&m| m as u8).collect();
+        let image_pad_mask = Tensor::new(image_pad_mask.as_slice(), &self.device)?;
+        EmbedNd::new(self.cfg.hidden_size(), self.cfg.rope_theta, self.cfg.axes_dims_rope, &self.device)?
+            .forward(&layout.img_shapes, &image_pad_mask, &self.device)
+    }
+
+    /// Valid keys over the whole joint sequence; only prompt (text) positions
+    /// can be padding.
+    fn key_valid(&self, txt_mask: Option<&Tensor>, layout: &JointLayout, seq_txt: usize, seq_img: usize) -> Result<Option<Tensor>> {
+        let Some(mask) = txt_mask else { return Ok(None) };
+        let mask = mask.to_dtype(candle_core::DType::U8)?;
+        let b = mask.dim(0)?;
+        let cond_ones = Tensor::ones((b, layout.len() - seq_txt - seq_img), candle_core::DType::U8, &self.device)?;
+        let target_ones = Tensor::ones((b, seq_img), candle_core::DType::U8, &self.device)?;
+        Ok(Some(layout.assemble(&mask, Some(&cond_ones), &target_ones)?))
+    }
+
+    /// See `QwenImageTransformer::prefix_kv`.
+    fn prefix_kv(
+        &self,
+        txt: &Tensor,
+        txt_mask: Option<&Tensor>,
+        condition: Option<&ConditionTokens>,
+        layout: &JointLayout,
+        target: &Tensor,
+    ) -> Result<TextKvCache> {
+        let prefix_len = layout.prefix_len;
+        let (batch, seq_img, _) = target.dims3()?;
+        let txt = match &self.txt_in {
+            Some(txt_in) => txt_in.forward(txt)?,
+            None => txt.clone(),
+        };
+        let cond = condition.map(|c| c.latents.apply(&self.img_in)).transpose()?;
+        let x = layout.assemble(&txt, cond.as_ref(), target)?.narrow(1, 0, prefix_len)?.contiguous()?;
+        let modulation = self.zero_modulation(x.dtype())?;
+        let pe = self.rope(layout)?.narrow(0, 0, prefix_len)?;
+        let key_valid = self
+            .key_valid(txt_mask, layout, txt.dim(1)?, seq_img)?
+            .map(|kv| kv.narrow(1, 0, prefix_len))
+            .transpose()?;
+        let image_ids = Tensor::new(&layout.image_ids[..prefix_len], &self.device)?;
+        let mask = build_block_causal_mask(&image_ids, key_valid.as_ref(), batch, &self.device)?;
+
+        let mut h = x;
+        let mut layers = Vec::with_capacity(self.transformer_blocks.len());
+        for block in &self.transformer_blocks {
+            let (out, k, v) = block.forward(&h, &modulation, &pe, Some(&mask), None)?;
+            layers.push((k.to_dtype(crate::transformer::KV_CACHE_DTYPE)?, v.to_dtype(crate::transformer::KV_CACHE_DTYPE)?));
+            h = out;
+        }
+        Ok(TextKvCache { layers })
     }
 
     pub fn new(cfg: &Config, vb: VarBuilder) -> Result<Self> {
@@ -411,8 +454,18 @@ impl QwenImageTransformerQuantized {
             (height / vae_scale_factor, width / vae_scale_factor),
         )?;
         let prefix_len = layout.prefix_len;
+        // An empty cache is filled by a prefix-only pass; see
+        // `QwenImageTransformer::forward_conditioned`.
+        let mut cache = cache;
+        if let Some(slot) = cache.as_deref_mut() {
+            if slot.is_none() && prefix_len > 0 {
+                let Some(txt) = text_emb else {
+                    candle_core::bail!("a prefix cache needs the prompt embedding");
+                };
+                *slot = Some(self.prefix_kv(txt, encoder_hidden_states_mask, condition, &layout, &target)?);
+            }
+        }
         let cached = cache.as_ref().and_then(|c| c.as_ref()).cloned();
-        let extract = prefix_len > 0 && cache.is_some() && cached.is_none();
 
         // With a cached prefix, text and condition tokens are not recomputed at all.
         let x = match (text_emb, &cached) {
@@ -428,28 +481,22 @@ impl QwenImageTransformerQuantized {
         };
 
         let t_emb = self.time_text_embed.forward(timestep)?;
-        let modulation_prefix = if cached.is_some() { 0 } else { prefix_len };
-        let modulation = self.per_token_modulation(&t_emb, modulation_prefix, seq_img, x.dtype())?;
+        let width = 4 * self.cfg.hidden_size();
+        let modulation_real = self.modulation.forward(&t_emb)?.unsqueeze(1)?; // [B, 1, 4*hidden]
+        let modulation = if prefix_len > 0 && cached.is_none() {
+            // Uncached full sequence: per-token rows, t=0 for the prefix.
+            let zero = self.zero_modulation(x.dtype())?.broadcast_as((batch, prefix_len, width))?.contiguous()?;
+            let real = modulation_real.broadcast_as((batch, seq_img, width))?.contiguous()?;
+            Tensor::cat(&[&zero, &real], 1)?
+        } else {
+            modulation_real
+        };
 
         // RoPE over the full joint layout; a cached step keeps only the target rows.
-        let image_pad_mask: Vec<u8> = layout.image_pad_mask.iter().map(|&m| m as u8).collect();
-        let image_pad_mask = Tensor::new(image_pad_mask.as_slice(), &self.device)?;
-        let pe = EmbedNd::new(self.cfg.hidden_size(), self.cfg.rope_theta, self.cfg.axes_dims_rope, &self.device)?
-            .forward(&layout.img_shapes, &image_pad_mask, &self.device)?;
+        let pe = self.rope(&layout)?;
         let pe = if cached.is_some() { pe.narrow(0, prefix_len, seq_img)?.contiguous()? } else { pe };
 
-        // Keys cover the whole joint sequence in both modes; only prompt
-        // (text) positions can be padding.
-        let key_valid = match encoder_hidden_states_mask {
-            Some(mask) => {
-                let mask = mask.to_dtype(candle_core::DType::U8)?;
-                let b = mask.dim(0)?;
-                let cond_ones = Tensor::ones((b, layout.len() - seq_txt - seq_img), candle_core::DType::U8, &self.device)?;
-                let target_ones = Tensor::ones((b, seq_img), candle_core::DType::U8, &self.device)?;
-                Some(layout.assemble(&mask, Some(&cond_ones), &target_ones)?)
-            }
-            None => None,
-        };
+        let key_valid = self.key_valid(encoder_hidden_states_mask, &layout, seq_txt, seq_img)?;
         let attention_mask = if cached.is_some() {
             // Target queries see every (valid) prefix key and every target key.
             match &key_valid {
@@ -462,19 +509,10 @@ impl QwenImageTransformerQuantized {
         };
 
         let mut h = x;
-        let mut extracted = Vec::with_capacity(if extract { self.transformer_blocks.len() } else { 0 });
         for (i, block) in self.transformer_blocks.iter().enumerate() {
             let prefix = cached.as_ref().map(|c| &c.layers[i]);
-            let (out, k, v) = block.forward(&h, &modulation, &pe, attention_mask.as_ref(), prefix)?;
-            if extract {
-                extracted.push((k.narrow(2, 0, prefix_len)?.to_dtype(crate::transformer::KV_CACHE_DTYPE)?, v.narrow(2, 0, prefix_len)?.to_dtype(crate::transformer::KV_CACHE_DTYPE)?));
-            }
+            let (out, _, _) = block.forward(&h, &modulation, &pe, attention_mask.as_ref(), prefix)?;
             h = out;
-        }
-        if extract {
-            if let Some(cache) = cache {
-                *cache = Some(TextKvCache { layers: extracted });
-            }
         }
 
         let output = self.final_layer.forward(&h, &t_emb)?.apply(&self.proj_out)?;
