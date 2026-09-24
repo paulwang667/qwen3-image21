@@ -1,5 +1,5 @@
 use candle_core::{Result, Tensor, Device, DType};
-use crate::transformer::QwenImageTransformer;
+use crate::transformer::{QwenImageTransformer, TextKvCache};
 use crate::quantized_transformer::QwenImageTransformerQuantized;
 use crate::scheduler::FlowMatchEuler;
 use crate::vae::{Config as VaeConfig, VaeDecoder, pack_latents, unpack_latents, normalize_latents};
@@ -31,11 +31,21 @@ impl TransformerType {
         }
     }
 
-    /// Number of transformer blocks (for KV cache allocation).
-    pub fn num_blocks(&self) -> usize {
+    /// Forward pass reusing the text prefix's K/V across steps (see
+    /// `transformer::TextKvCache`); `cache` must belong to this `text_emb`.
+    pub fn forward_with_text_cache(
+        &self,
+        latents: &Tensor,
+        timestep: &Tensor,
+        text_emb: &Tensor,
+        text_emb_mask: Option<&Tensor>,
+        height: usize,
+        width: usize,
+        cache: &mut Option<TextKvCache>,
+    ) -> Result<Tensor> {
         match self {
-            Self::NonQuantized(t) => t.transformer_blocks.len(),
-            Self::Quantized(t) => t.transformer_blocks.len(),
+            Self::NonQuantized(t) => t.forward_with_text_cache(latents, text_emb, text_emb_mask, timestep, height, width, cache),
+            Self::Quantized(t) => t.forward_with_text_cache(latents, text_emb, text_emb_mask, timestep, height, width, cache),
         }
     }
 }
@@ -60,6 +70,7 @@ pub fn denoise(
     width: usize,
     num_inference_steps: usize,
     guidance: Option<(&Tensor, f32)>,
+    use_kv_cache: bool,
     cfg: &PipelineConfig,
 ) -> Result<Tensor> {
     let batch_size = prompt_emb.dim(0)?;
@@ -96,6 +107,17 @@ pub fn denoise(
     eprintln!("  img_ids shape: {:?}", img_ids.shape());
     eprintln!("  txt_ids shape: {:?}", txt_ids.shape());
 
+    // One text-prefix K/V cache per prompt (positive, and negative under CFG).
+    let mut cache: Option<TextKvCache> = None;
+    let mut neg_cache: Option<TextKvCache> = None;
+    let predict = |text: &Tensor, timestep: &Tensor, latents: &Tensor, cache: &mut Option<TextKvCache>| -> Result<Tensor> {
+        if use_kv_cache {
+            transformer.forward_with_text_cache(latents, timestep, text, None, height, width, cache)
+        } else {
+            transformer.forward(latents, timestep, text, None, &img_ids, &txt_ids, height, width)
+        }
+    };
+
     // Denoising loop
     for i in 0..num_inference_steps {
         let t = timesteps[i];
@@ -109,17 +131,11 @@ pub fn denoise(
         let timestep = crate::scheduler::timestep_embedding(&timestep, 256)?
             .to_dtype(packed_latents.dtype())?;
 
-        let noise_pred = transformer.forward(
-            &packed_latents, &timestep, &prompt_emb, None, &img_ids, &txt_ids,
-            height, width,
-        )?;
+        let noise_pred = predict(&prompt_emb, &timestep, &packed_latents, &mut cache)?;
         // Upstream QwenImage21Pipeline: neg + scale * (cond - neg), no rescaling.
         let noise_pred = match &guidance {
             Some((neg_emb, scale)) => {
-                let neg_pred = transformer.forward(
-                    &packed_latents, &timestep, neg_emb, None, &img_ids, &txt_ids,
-                    height, width,
-                )?;
+                let neg_pred = predict(neg_emb, &timestep, &packed_latents, &mut neg_cache)?;
                 (&neg_pred + ((&noise_pred - &neg_pred)? * *scale as f64)?)?
             }
             None => noise_pred,

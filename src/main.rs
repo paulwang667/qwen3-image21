@@ -43,6 +43,11 @@ struct Args {
     #[arg(long, default_value_t = 1.0)]
     true_cfg_scale: f32,
 
+    /// Recompute the text prefix every step instead of caching its per-layer
+    /// K/V (the cache is exact under causal_condition; this is for A/B checks)
+    #[arg(long)]
+    no_kv_cache: bool,
+
     /// Use quantized model
     #[arg(long)]
     quantized: bool,
@@ -222,7 +227,7 @@ fn main() -> Result<()> {
 
         // Warmup
         eprintln!("Warming up...");
-        let _ = denoise(&transformer, &prompt_emb, args.height, args.width, args.steps, guidance, &pipeline_cfg)?;
+        let _ = denoise(&transformer, &prompt_emb, args.height, args.width, args.steps, guidance, !args.no_kv_cache, &pipeline_cfg)?;
 
         // Timed iterations
         let mut times = Vec::with_capacity(args.benchmark_iterations);
@@ -230,7 +235,7 @@ fn main() -> Result<()> {
         for i in 1..=args.benchmark_iterations {
             eprintln!("Benchmark iteration {}/{}", i, args.benchmark_iterations);
             let start = std::time::Instant::now();
-            let latents = denoise(&transformer, &prompt_emb, args.height, args.width, args.steps, guidance, &pipeline_cfg)?;
+            let latents = denoise(&transformer, &prompt_emb, args.height, args.width, args.steps, guidance, !args.no_kv_cache, &pipeline_cfg)?;
             let img = decode_latents(&vae_decoder, &latents, args.height, args.width, &pipeline_cfg)?;
             let elapsed = start.elapsed();
             times.push(elapsed);
@@ -261,7 +266,7 @@ fn main() -> Result<()> {
 
         eprintln!("  Denoising ({} steps)...", args.steps);
         let start = std::time::Instant::now();
-        let latents = denoise(&transformer, &prompt_emb, args.height, args.width, args.steps, guidance, &pipeline_cfg)?;
+        let latents = denoise(&transformer, &prompt_emb, args.height, args.width, args.steps, guidance, !args.no_kv_cache, &pipeline_cfg)?;
         eprintln!("  Denoising done in {:.2}s", start.elapsed().as_secs_f32());
 
         // Debug hook: dump the real packed latents for offline VAE diagnostics

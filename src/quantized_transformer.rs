@@ -5,7 +5,7 @@ use candle_transformers::quantized_var_builder::VarBuilder;
 use crate::rope::{apply_rope, EmbedNd};
 use crate::scheduler::timestep_embedding;
 use crate::attention_mask::{build_token_metadata, build_block_causal_mask};
-use crate::transformer::KVCache;
+use crate::transformer::TextKvCache;
 
 /// Qwen-Image-2.1 config - same as non-quantized.
 pub use crate::transformer::Config;
@@ -97,7 +97,15 @@ impl Attention {
         })
     }
 
-    fn forward(&self, x: &Tensor, pe: &Tensor, attention_mask: Option<&Tensor>) -> Result<Tensor> {
+    /// See `transformer::Attention::forward`: `prefix` is the cached text-prefix
+    /// `(k, v)`; returns the output plus this call's own `(k, v)`.
+    fn forward(
+        &self,
+        x: &Tensor,
+        pe: &Tensor,
+        attention_mask: Option<&Tensor>,
+        prefix: Option<&(Tensor, Tensor)>,
+    ) -> Result<(Tensor, Tensor, Tensor)> {
         let (b, seq, _) = x.dims3()?;
 
         let q = x.apply(&self.to_q)?;
@@ -115,11 +123,14 @@ impl Attention {
         eprintln!("  [Attention] after rope q.shape={:?}", q.shape());
         let k = apply_rope(&k, pe)?;
         eprintln!("  [Attention] after rope k.shape={:?}", k.shape());
-
+        let (k_all, v_all) = match prefix {
+            Some((pk, pv)) => (Tensor::cat(&[pk, &k], 2)?, Tensor::cat(&[pv, &v], 2)?),
+            None => (k.clone(), v.clone()),
+        };
 
         let scale = (self.dim_head as f64).powf(-0.5);
-        eprintln!("  [Attention] q.shape={:?}, k.shape={:?}, v.shape={:?}, scale={}", q.shape(), k.shape(), v.shape(), scale);
-        let mut attn_weights = q.matmul(&k.transpose(2, 3)?)?.affine(scale, 0.0)?;
+        eprintln!("  [Attention] q.shape={:?}, k.shape={:?}, v.shape={:?}, scale={}", q.shape(), k_all.shape(), v_all.shape(), scale);
+        let mut attn_weights = q.matmul(&k_all.transpose(2, 3)?)?.affine(scale, 0.0)?;
         eprintln!("  [Attention] after matmul attn_weights.shape={:?}", attn_weights.shape());
         // Apply attention mask: convert bool mask (True=attend) to additive (0/-inf)
         if let Some(mask) = attention_mask {
@@ -130,76 +141,10 @@ impl Attention {
         }
 
         let attn_weights = candle_nn::ops::softmax(&attn_weights, D::Minus1)?;
-        let attn_out = attn_weights.matmul(&v)?;
+        let attn_out = attn_weights.matmul(&v_all)?;
 
         let attn_out = attn_out.transpose(1, 2)?.reshape((b, seq, self.inner_dim))?;
-        attn_out.apply(&self.to_out)
-    }
-
-    /// Cached forward pass with KV cache support.
-    fn forward_cached(
-        &self,
-        x: &Tensor,
-        pe: &Tensor,
-        attention_mask: Option<&Tensor>,
-        kv_cache: Option<&mut crate::transformer::KVCache>,
-    ) -> Result<Tensor> {
-        let (b, seq, _) = x.dims3()?;
-
-        // Project query
-        let q = x.apply(&self.to_q)?;
-        let k = x.apply(&self.to_k)?;
-        let v = x.apply(&self.to_v)?;
-
-        // Reshape to [B, H, S, D]
-        let q = q.reshape((b, seq, self.heads, self.dim_head))?.transpose(1, 2)?;
-        let k = k.reshape((b, seq, self.heads, self.dim_head))?.transpose(1, 2)?;
-        let v = v.reshape((b, seq, self.heads, self.dim_head))?.transpose(1, 2)?.contiguous()?; // Metal matmul needs contiguous operands
-
-        // Apply Q/K normalization
-        let q = q.apply(&self.norm_q)?;
-        let k = k.apply(&self.norm_k)?;
-
-        // Apply RoPE
-        let q = apply_rope(&q, pe)?;
-        let k = apply_rope(&k, pe)?;
-
-        // Concatenate with cached k/v if available
-        let (k_full, v_full) = if let Some(cache) = kv_cache.as_ref() {
-            if let Some((kc, vc)) = cache.get_cached() {
-                let k_cat = Tensor::cat(&[kc, &k], 2)?;
-                let v_cat = Tensor::cat(&[vc, &v], 2)?;
-                (k_cat, v_cat)
-            } else {
-                (k, v)
-            }
-        } else {
-            (k, v)
-        };
-
-        // Update cache with new k/v
-        if let Some(cache) = kv_cache {
-            let _ = cache.update(&k_full, &v_full);
-        }
-
-        // Attention
-        let scale = (self.dim_head as f64).powf(-0.5);
-        let mut attn_weights = q.matmul(&k_full.transpose(2, 3)?)?.affine(scale, 0.0)?;
-
-        // Apply attention mask: convert bool mask (True=attend) to additive (0/-inf)
-        if let Some(mask) = attention_mask {
-            let neg_inf = Tensor::new(f32::NEG_INFINITY, attn_weights.device())?.broadcast_as(mask.dims())?.contiguous()?;
-            let zero = Tensor::new(0.0f32, attn_weights.device())?.broadcast_as(mask.dims())?.contiguous()?;
-            let additive_mask = mask.where_cond(&zero, &neg_inf)?;
-            attn_weights = attn_weights.broadcast_add(&additive_mask)?;
-        }
-
-        let attn_weights = candle_nn::ops::softmax(&attn_weights, D::Minus1)?;
-        let attn_out = attn_weights.matmul(&v_full)?;
-
-        // Reshape back: [B, H, S, D] -> [B, S, D]
-        let attn_out = attn_out.transpose(1, 2)?.reshape((b, seq, self.inner_dim))?;
-        attn_out.apply(&self.to_out)
+        Ok((attn_out.apply(&self.to_out)?, k, v))
     }
 }
 
@@ -301,7 +246,7 @@ impl TransformerBlock {
         Ok(Self { norm1, attn, norm2, mlp })
     }
 
-    fn forward(&self, x: &Tensor, modulation: &Tensor, pe: &Tensor, attention_mask: Option<&Tensor>, _modulation_row_indices: Option<&Tensor>) -> Result<Tensor> {
+    fn forward(&self, x: &Tensor, modulation: &Tensor, pe: &Tensor, attention_mask: Option<&Tensor>, prefix: Option<&(Tensor, Tensor)>) -> Result<(Tensor, Tensor, Tensor)> {
         // Per-token modulation [B, seq, 4*hidden] -> [scale1, gate1, scale2, gate2]
         let parts = modulation.chunk(4, D::Minus1)?;
         let scale1 = parts[0].clone();
@@ -315,7 +260,7 @@ impl TransformerBlock {
         let normed = self.norm1.forward(x)?;
         let scale1_u = scale1.affine(1.0, 1.0)?;
         let normed = normed.broadcast_mul(&scale1_u)?;
-        let attn_out = self.attn.forward(&normed, pe, attention_mask)?;
+        let (attn_out, k, v) = self.attn.forward(&normed, pe, attention_mask, prefix)?;
         let gate1_u = gate1.tanh()?;
         let attn_out = gate1_u.broadcast_mul(&attn_out)?;
         let x = x.broadcast_add(&attn_out)?;
@@ -329,51 +274,7 @@ impl TransformerBlock {
         let mlp_out = gate2_u.broadcast_mul(&mlp_out)?;
         let x = x.broadcast_add(&mlp_out)?;
 
-        Ok(x)
-    }
-
-    /// Cached forward pass with KV cache support.
-    fn forward_cached(
-        &self,
-        x: &Tensor,
-        modulation: &Tensor,
-        pe: &Tensor,
-        attention_mask: Option<&Tensor>,
-        _modulation_row_indices: Option<&Tensor>,
-        kv_caches: &mut [crate::transformer::KVCache],
-    ) -> Result<Tensor> {
-        // Per-token modulation [B, seq, 4*hidden] -> [scale1, gate1, scale2, gate2]
-        let parts = modulation.chunk(4, D::Minus1)?;
-        let scale1 = parts[0].clone();
-        let gate1 = parts[1].clone();
-        let scale2 = parts[2].clone();
-        let gate2 = parts[3].clone();
-
-        // Attention: scale1 * norm1(x), gate1.tanh() * attn
-        let normed = self.norm1.forward(x)?;
-        let scale1_u = scale1.affine(1.0, 1.0)?;
-        let normed = normed.broadcast_mul(&scale1_u)?;
-
-        let attn_out = if let Some(cache) = kv_caches.get_mut(0) {
-            self.attn.forward_cached(&normed, pe, attention_mask, Some(cache))?
-        } else {
-            self.attn.forward_cached(&normed, pe, attention_mask, None)?
-        };
-
-        let gate1_u = gate1.tanh()?;
-        let attn_out = gate1_u.broadcast_mul(&attn_out)?;
-        let x = x.broadcast_add(&attn_out)?;
-
-        // MLP: scale2 * norm2(x), gate2.tanh() * mlp
-        let normed = self.norm2.forward(&x)?;
-        let scale2_u = scale2.affine(1.0, 1.0)?;
-        let normed = normed.broadcast_mul(&scale2_u)?;
-        let mlp_out = self.mlp.forward(&normed)?;
-        let gate2_u = gate2.tanh()?;
-        let mlp_out = gate2_u.broadcast_mul(&mlp_out)?;
-        let x = x.broadcast_add(&mlp_out)?;
-
-        Ok(x)
+        Ok((x, k, v))
     }
 }
 
@@ -475,197 +376,114 @@ impl QwenImageTransformerQuantized {
         text_emb: Option<&Tensor>,
         encoder_hidden_states_mask: Option<&Tensor>,
         timestep: &Tensor,
-        img_ids: &Tensor,
-        txt_ids: &Tensor,
+        _img_ids: &Tensor,
+        _txt_ids: &Tensor,
         height: usize,
         width: usize,
     ) -> Result<Tensor> {
-        eprintln!("  [quantized forward] hidden_states.shape={:?}, timestep.shape={:?}", hidden_states.shape(), timestep.shape());
-        // Project image
-        // Project image
-        let x = hidden_states.apply(&self.img_in)?;
-
-        // Embed text
-        let txt_embedded = if let Some(txt) = text_emb {
-            if let Some(txt_in) = &self.txt_in {
-                Some(txt_in.forward(txt)?)
-            } else {
-                Some(txt.clone())
-            }
-        } else {
-            None
-        };
-
-        // Concatenate [txt, img]
-        let has_text = txt_embedded.is_some();
-        let seq_txt = if let Some(ref txt) = txt_embedded { txt.dim(1)? } else { 0 };
-        let seq_img = x.dim(1)?;
-        let x = if let Some(txt) = txt_embedded {
-            Tensor::cat(&[txt, x], 1)?
-        } else {
-            x
-        };
-
-        // Timestep
-        let t_emb = self.time_text_embed.forward(timestep)?;
-
-        let modulation = self.per_token_modulation(&t_emb, seq_txt, seq_img, x.dtype())?;
-        eprintln!("  [quantized forward] modulation.shape={:?}, x.shape={:?}", modulation.shape(), x.shape());
-
-        // RoPE using new QwenImage21Rope API
-        let image_pad_mask: Vec<u8> = vec![0u8; seq_txt].into_iter()
-            .chain(vec![1u8; seq_img])
-            .collect();
-        let image_pad_mask = Tensor::new(image_pad_mask.as_slice(), &self.device)?
-            .to_dtype(candle_core::DType::U8)?;
-        // img_shapes: (frame, height_patches, width_patches) for image blocks
-        // VAE scale factor is 16 (AutoencoderKLQwenImage21), patch size is 2
-        // patch_size=1: each latent pixel is its own token, no 2x2 packing
-        let vae_scale_factor = 16;
-        let h_patches = height / vae_scale_factor;
-        let w_patches = width / vae_scale_factor;
-        let img_shapes = [(1, h_patches, w_patches)];
-        let pe = EmbedNd::new(self.cfg.hidden_size(), self.cfg.rope_theta, self.cfg.axes_dims_rope, &self.device)?
-            .forward(&img_shapes, &image_pad_mask, &self.device)?;
-
-        // Build token metadata for attention mask and modulation row selection
-        let joint_seq_len = x.dim(1)?;
-        let (image_ids, target_token_mask, _block_boundaries) = build_token_metadata(&img_shapes, seq_txt, joint_seq_len, &self.device)?;
-
-        // Build key_valid mask from encoder_hidden_states_mask (if available)
-        let key_valid = if let Some(mask) = encoder_hidden_states_mask {
-            // mask: [batch, text_seq_len] -> expand to joint sequence
-            let text_mask = mask.to_dtype(candle_core::DType::U8)?;
-            // Create ones for image positions
-            let batch = text_mask.dim(0)?;
-            let img_ones = Tensor::ones((batch, seq_img), candle_core::DType::U8, &self.device)?;
-            // Concatenate text mask and image ones
-            Some(Tensor::cat(&[text_mask, img_ones], 1)?)
-        } else {
-            None
-        };
-
-        // Build block-causal attention mask
-        let attention_mask = build_block_causal_mask(&image_ids, key_valid.as_ref(), 1, &self.device)?;
-
-        // Blocks
-        let mut h = x;
-        for block in &self.transformer_blocks {
-            h = block.forward(&h, &modulation, &pe, Some(&attention_mask), Some(&target_token_mask))?;
-        }
-
-        // Final layer
-        let output = self.final_layer.forward(&h, &t_emb)?;
-        // Final projection
-        let output = output.apply(&self.proj_out)?;
-
-        // Extract image part
-        let output = if seq_txt > 0 {
-            output.narrow(1, seq_txt, seq_img)?
-        } else {
-            output
-        };
-
-        Ok(output)
+        self.forward_impl(hidden_states, text_emb, encoder_hidden_states_mask, timestep, height, width, None)
     }
 
-    /// Cached forward pass with KV cache support.
-    pub fn forward_cached(
+    /// See `QwenImageTransformer::forward_with_text_cache`.
+    pub fn forward_with_text_cache(
+        &self,
+        hidden_states: &Tensor,
+        text_emb: &Tensor,
+        encoder_hidden_states_mask: Option<&Tensor>,
+        timestep: &Tensor,
+        height: usize,
+        width: usize,
+        cache: &mut Option<TextKvCache>,
+    ) -> Result<Tensor> {
+        self.forward_impl(hidden_states, Some(text_emb), encoder_hidden_states_mask, timestep, height, width, Some(cache))
+    }
+
+    fn forward_impl(
         &self,
         hidden_states: &Tensor,
         text_emb: Option<&Tensor>,
         encoder_hidden_states_mask: Option<&Tensor>,
         timestep: &Tensor,
-        img_ids: &Tensor,
-        txt_ids: &Tensor,
         height: usize,
         width: usize,
-        kv_caches: &mut [crate::transformer::KVCache],
+        cache: Option<&mut Option<TextKvCache>>,
     ) -> Result<Tensor> {
-        // Project image
         let x = hidden_states.apply(&self.img_in)?;
+        let (batch, seq_img, _) = x.dims3()?;
+        let seq_txt = text_emb.map_or(Ok(0), |t| t.dim(1))?;
+        let cached = cache.as_ref().and_then(|c| c.as_ref()).cloned();
+        let extract = seq_txt > 0 && cache.is_some() && cached.is_none();
 
-        // Embed text
-        let txt_embedded = if let Some(txt) = text_emb {
-            if let Some(txt_in) = &self.txt_in {
-                Some(txt_in.forward(txt)?)
-            } else {
-                Some(txt.clone())
+        // With a cached prefix the text tokens are not recomputed at all.
+        let x = match (text_emb, &cached) {
+            (Some(txt), None) => {
+                let txt = match &self.txt_in {
+                    Some(txt_in) => txt_in.forward(txt)?,
+                    None => txt.clone(),
+                };
+                Tensor::cat(&[txt, x], 1)?
             }
-        } else {
-            None
+            _ => x,
         };
 
-        // Concatenate [txt, img]
-        let has_text = txt_embedded.is_some();
-        let seq_txt = if let Some(ref txt) = txt_embedded { txt.dim(1)? } else { 0 };
-        let seq_img = x.dim(1)?;
-        let x = if let Some(txt) = txt_embedded {
-            Tensor::cat(&[txt, x], 1)?
-        } else {
-            x
-        };
-
-        // Timestep
         let t_emb = self.time_text_embed.forward(timestep)?;
+        let modulation_txt = if cached.is_some() { 0 } else { seq_txt };
+        let modulation = self.per_token_modulation(&t_emb, modulation_txt, seq_img, x.dtype())?;
 
-        let modulation = self.per_token_modulation(&t_emb, seq_txt, seq_img, x.dtype())?;
-
-        // RoPE using new QwenImage21Rope API
+        // RoPE over the full joint layout; a cached step keeps only the image rows.
         let image_pad_mask: Vec<u8> = vec![0u8; seq_txt].into_iter()
             .chain(vec![1u8; seq_img])
             .collect();
         let image_pad_mask = Tensor::new(image_pad_mask.as_slice(), &self.device)?
             .to_dtype(candle_core::DType::U8)?;
-        // img_shapes: (frame, height_patches, width_patches) for image blocks
-        // VAE scale factor is 16 (AutoencoderKLQwenImage21), patch size is 2
         // patch_size=1: each latent pixel is its own token, no 2x2 packing
         let vae_scale_factor = 16;
-        let h_patches = height / vae_scale_factor;
-        let w_patches = width / vae_scale_factor;
-        let img_shapes = [(1, h_patches, w_patches)];
+        let img_shapes = [(1, height / vae_scale_factor, width / vae_scale_factor)];
         let pe = EmbedNd::new(self.cfg.hidden_size(), self.cfg.rope_theta, self.cfg.axes_dims_rope, &self.device)?
             .forward(&img_shapes, &image_pad_mask, &self.device)?;
+        let pe = if cached.is_some() { pe.narrow(0, seq_txt, seq_img)?.contiguous()? } else { pe };
 
-        // Build token metadata for attention mask and modulation row selection
-        let joint_seq_len = x.dim(1)?;
-        let (image_ids, target_token_mask, _block_boundaries) = build_token_metadata(&img_shapes, seq_txt, joint_seq_len, &self.device)?;
-
-        // Build key_valid mask from encoder_hidden_states_mask (if available)
-        let key_valid = if let Some(mask) = encoder_hidden_states_mask {
-            // mask: [batch, text_seq_len] -> expand to joint sequence
-            let text_mask = mask.to_dtype(candle_core::DType::U8)?;
-            // Create ones for image positions
-            let batch = text_mask.dim(0)?;
-            let img_ones = Tensor::ones((batch, seq_img), candle_core::DType::U8, &self.device)?;
-            // Concatenate text mask and image ones
-            Some(Tensor::cat(&[text_mask, img_ones], 1)?)
+        // Keys cover [text ; image] in both modes: [B, seq_txt + seq_img].
+        let key_valid = match encoder_hidden_states_mask {
+            Some(mask) => {
+                let img_ones = Tensor::ones((mask.dim(0)?, seq_img), candle_core::DType::U8, &self.device)?;
+                Some(Tensor::cat(&[mask.to_dtype(candle_core::DType::U8)?, img_ones], 1)?)
+            }
+            None => None,
+        };
+        let attention_mask = if cached.is_some() {
+            // Image queries see every (valid) text key and every image key.
+            match &key_valid {
+                Some(kv) => Some(kv.unsqueeze(1)?.unsqueeze(1)?),
+                None => None,
+            }
         } else {
-            None
+            let (image_ids, _, _) = build_token_metadata(&img_shapes, seq_txt, x.dim(1)?, &self.device)?;
+            Some(build_block_causal_mask(&image_ids, key_valid.as_ref(), batch, &self.device)?)
         };
 
-        // Build block-causal attention mask
-        let attention_mask = build_block_causal_mask(&image_ids, key_valid.as_ref(), 1, &self.device)?;
-
-        // Blocks
         let mut h = x;
-        for block in &self.transformer_blocks {
-            h = block.forward(&h, &modulation, &pe, Some(&attention_mask), Some(&target_token_mask))?;
+        let mut extracted = Vec::with_capacity(if extract { self.transformer_blocks.len() } else { 0 });
+        for (i, block) in self.transformer_blocks.iter().enumerate() {
+            let prefix = cached.as_ref().map(|c| &c.layers[i]);
+            let (out, k, v) = block.forward(&h, &modulation, &pe, attention_mask.as_ref(), prefix)?;
+            if extract {
+                extracted.push((k.narrow(2, 0, seq_txt)?.contiguous()?, v.narrow(2, 0, seq_txt)?.contiguous()?));
+            }
+            h = out;
+        }
+        if extract {
+            if let Some(cache) = cache {
+                *cache = Some(TextKvCache { layers: extracted });
+            }
         }
 
-        // Final layer
-        let output = self.final_layer.forward(&h, &t_emb)?;
-        // Final projection
-        let output = output.apply(&self.proj_out)?;
-
-        // Extract image part
-        let output = if seq_txt > 0 {
-            output.narrow(1, seq_txt, seq_img)?
+        let output = self.final_layer.forward(&h, &t_emb)?.apply(&self.proj_out)?;
+        if seq_txt > 0 && cached.is_none() {
+            output.narrow(1, seq_txt, seq_img)
         } else {
-            output
-        };
-
-        Ok(output)
+            Ok(output)
+        }
     }
 }
 
