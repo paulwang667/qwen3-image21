@@ -88,7 +88,7 @@ With classifier-free guidance (roughly doubles the denoising time):
 
 ### Multi-reference example
 
-Two 1024×1024 references combined into a 768×1024 poster with Chinese calligraphy lettering (Q4_K_M, 20 steps, 108 s denoising):
+Two 1024×1024 references combined into a 768×1024 poster with Chinese calligraphy lettering (Q4_K_M + `--precision bf16`, 20 steps, 108 s denoising, 20.1 GiB peak GPU memory):
 
 | Reference 1 | Reference 2 | Result |
 |---|---|---|
@@ -98,14 +98,14 @@ Two 1024×1024 references combined into a 768×1024 poster with Chinese calligra
 ./target/release/qwen3-image21 \
   --prompt '参考图1中的青花瓷茶杯和图2中的红苹果，设计一张秋日下午茶宣传海报。画面中央是图1的青花瓷茶杯和图2的红苹果，摆放在温暖的木桌上，周围点缀几片金黄的枫叶，背景柔和温暖。海报顶部用大号中文书法艺术字写"秋日茶语"，底部用优雅的中文字体写"一杯清茶 一份甜蜜"。' \
   --image teacup.png --image apple.png \
-  --width 768 --height 1024 --steps 20 \
-  --model-path models/qwen-image-2.1-Q4_K_M.gguf \
+  --width 768 --height 1024 --steps 20 --seed 14065671437376715125 \
+  --model-path models/qwen-image-2.1-Q4_K_M.gguf --precision bf16 \
   --vae-path $R/vae/diffusion_pytorch_model.safetensors \
   --text-encoder-path $R/text_encoder \
   --output poster.png
 ```
 
-The teacup keeps reference 1's blue floral pattern, gold rim, and saucer; the apple matches reference 2; both lines of Chinese text render without errors. Each 1024² reference adds 1,024 image tokens to the prompt (2,165 prompt tokens here) and 4,096 latent tokens to the transformer, so this run's sequence is 117 text + 8,192 reference + 3,072 target ≈ 11,400 tokens, and its prefix KV cache is ~4.4 GB (stored in BF16). With `--precision bf16` added (BF16 text encoder), this poster peaks at 20.1 GiB on the GPU.
+The teacup keeps reference 1's blue floral pattern, gold rim, and saucer; the apple matches reference 2; both lines of Chinese text render without errors. Each 1024² reference adds 1,024 image tokens to the prompt (2,165 prompt tokens here) and 4,096 latent tokens to the transformer, so this run's sequence is 117 text + 8,192 reference + 3,072 target ≈ 11,400 tokens, and its prefix KV cache is ~4.4 GB (stored in BF16). `--precision bf16` puts the text encoder in BF16; the GGUF transformer still computes in F32.
 
 ### Options
 
