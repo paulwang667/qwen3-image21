@@ -113,12 +113,9 @@ impl Attention {
         let k = x.apply(&self.to_k)?;
         let v = x.apply(&self.to_v)?;
 
-        let q = q.reshape((b, seq, self.heads, self.dim_head))?.transpose(1, 2)?;
-        let k = k.reshape((b, seq, self.heads, self.dim_head))?.transpose(1, 2)?;
+        let q = q.reshape((b, seq, self.heads, self.dim_head))?.apply(&self.norm_q)?.transpose(1, 2)?;
+        let k = k.reshape((b, seq, self.heads, self.dim_head))?.apply(&self.norm_k)?.transpose(1, 2)?;
         let v = v.reshape((b, seq, self.heads, self.dim_head))?.transpose(1, 2)?.contiguous()?; // Metal matmul needs contiguous operands
-
-        let q = q.apply(&self.norm_q)?;
-        let k = k.apply(&self.norm_k)?;
 
         let q = apply_rope(&q, pe)?;
         eprintln!("  [Attention] after rope q.shape={:?}", q.shape());
@@ -211,8 +208,11 @@ impl Modulation {
 }
 
 fn layer_norm_no_bias(dim: usize, device: &Device) -> Result<LayerNorm> {
+    // Zero bias so candle takes its fused layer-norm kernel (see
+    // `transformer::fixed_layer_norm`); mathematically still bias-free.
     let ws = Tensor::ones(dim, DType::F32, device)?;
-    Ok(LayerNorm::new_no_bias(ws, 1e-6))
+    let bias = Tensor::zeros(dim, DType::F32, device)?;
+    Ok(LayerNorm::new(ws, bias, 1e-6))
 }
 
 /// Quantized single-stream transformer block.

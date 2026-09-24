@@ -211,37 +211,20 @@ impl EmbedNd {
     }
 }
 
-/// Apply rotary embedding to query/key tensors using complex multiplication.
+/// Apply rotary embedding to query/key tensors: each interleaved (real, imag)
+/// pair of `x` is multiplied by the complex `freqs_cis` entry, via candle's
+/// fused `rope_i` kernel.
 ///
 /// Args:
 ///   - `x`: [batch, heads, seq_len, head_dim] where head_dim is even
 ///   - `freqs_cis`: [seq_len, head_dim] complex as interleaved [real, imag]
 /// Returns: [batch, heads, seq_len, head_dim] with RoPE applied
 pub fn apply_rope(x: &Tensor, freqs_cis: &Tensor) -> Result<Tensor> {
-    let (b, h, s, d) = x.dims4()?;
-    let half = d / 2;
-
-    // x: [b, h, s, d] -> [b, h, s, half, 2] (real, imag)
-    let x_reshaped = x.reshape((b, h, s, half, 2))?;
-    let x_real = x_reshaped.i((.., .., .., .., 0))?;
-    let x_imag = x_reshaped.i((.., .., .., .., 1))?;
-
-    // freqs_cis: [s, d] -> [s, half, 2] (real, imag)
-    let freqs_reshaped = freqs_cis.reshape((s, half, 2))?;
-    let cos = freqs_reshaped.i((.., .., 0))?.unsqueeze(0)?.unsqueeze(0)?; // [1, 1, s, half]
-    let sin = freqs_reshaped.i((.., .., 1))?.unsqueeze(0)?.unsqueeze(0)?;
-
-    // Complex multiplication: (a+bi)(c+di) = (ac-bd) + i(ad+bc)
-    // Rotate: x * freqs = (x_real + i*x_imag) * (cos + i*sin)
-    // = (x_real*cos - x_imag*sin) + i(x_real*sin + x_imag*cos)
-    let out_real = x_real.broadcast_mul(&cos)?.broadcast_sub(&x_imag.broadcast_mul(&sin)?)?;
-    let out_imag = x_real.broadcast_mul(&sin)?.broadcast_add(&x_imag.broadcast_mul(&cos)?)?;
-
-    // Interleave back: [out_real_0, out_imag_0, out_real_1, out_imag_1, ...]
-    let out_real_u = out_real.unsqueeze(4)?;
-    let out_imag_u = out_imag.unsqueeze(4)?;
-    let out = Tensor::cat(&[&out_real_u, &out_imag_u], 4)?.reshape((b, h, s, d))?;
-    Ok(out)
+    let (_, _, s, d) = x.dims4()?;
+    let freqs = freqs_cis.reshape((s, d / 2, 2))?;
+    let cos = freqs.i((.., .., 0))?.contiguous()?;
+    let sin = freqs.i((.., .., 1))?.contiguous()?;
+    candle_nn::rotary_emb::rope_i(&x.contiguous()?, &cos, &sin)
 }
 
 /// Compute position indices for 2D image patches (legacy compatibility).
@@ -330,5 +313,50 @@ mod tests {
                 );
             }
         }
+    }
+
+    /// The unfused complex-multiplication form `apply_rope` replaced.
+    ///
+    /// Args:
+    ///   - `x`: [batch, heads, seq_len, head_dim] where head_dim is even
+    ///   - `freqs_cis`: [seq_len, head_dim] complex as interleaved [real, imag]
+    /// Returns: [batch, heads, seq_len, head_dim] with RoPE applied
+    fn apply_rope_reference(x: &Tensor, freqs_cis: &Tensor) -> Result<Tensor> {
+        let (b, h, s, d) = x.dims4()?;
+        let half = d / 2;
+
+        // x: [b, h, s, d] -> [b, h, s, half, 2] (real, imag)
+        let x_reshaped = x.reshape((b, h, s, half, 2))?;
+        let x_real = x_reshaped.i((.., .., .., .., 0))?;
+        let x_imag = x_reshaped.i((.., .., .., .., 1))?;
+
+        // freqs_cis: [s, d] -> [s, half, 2] (real, imag)
+        let freqs_reshaped = freqs_cis.reshape((s, half, 2))?;
+        let cos = freqs_reshaped.i((.., .., 0))?.unsqueeze(0)?.unsqueeze(0)?; // [1, 1, s, half]
+        let sin = freqs_reshaped.i((.., .., 1))?.unsqueeze(0)?.unsqueeze(0)?;
+
+        // Complex multiplication: (a+bi)(c+di) = (ac-bd) + i(ad+bc)
+        // Rotate: x * freqs = (x_real + i*x_imag) * (cos + i*sin)
+        // = (x_real*cos - x_imag*sin) + i(x_real*sin + x_imag*cos)
+        let out_real = x_real.broadcast_mul(&cos)?.broadcast_sub(&x_imag.broadcast_mul(&sin)?)?;
+        let out_imag = x_real.broadcast_mul(&sin)?.broadcast_add(&x_imag.broadcast_mul(&cos)?)?;
+
+        // Interleave back: [out_real_0, out_imag_0, out_real_1, out_imag_1, ...]
+        let out_real_u = out_real.unsqueeze(4)?;
+        let out_imag_u = out_imag.unsqueeze(4)?;
+        let out = Tensor::cat(&[&out_real_u, &out_imag_u], 4)?.reshape((b, h, s, d))?;
+        Ok(out)
+    }
+
+    #[test]
+    fn test_apply_rope_matches_reference() {
+        let device = Device::Cpu;
+        let x = Tensor::randn(0f32, 1.0, (1, 3, 5, 16), &device).unwrap();
+        let angles = Tensor::randn(0f32, 3.0, (5, 8), &device).unwrap();
+        let freqs = Tensor::stack(&[angles.cos().unwrap(), angles.sin().unwrap()], 2).unwrap().reshape((5, 16)).unwrap();
+        let got = apply_rope(&x, &freqs).unwrap();
+        let want = apply_rope_reference(&x, &freqs).unwrap();
+        let diff = (got - want).unwrap().abs().unwrap().max_all().unwrap().to_scalar::<f32>().unwrap();
+        assert!(diff < 1e-5, "max diff {diff}");
     }
 }

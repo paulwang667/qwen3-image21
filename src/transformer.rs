@@ -153,14 +153,11 @@ impl Attention {
         let k = x.apply(&self.to_k)?;
         let v = x.apply(&self.to_v)?;
         
-        // Reshape to [B, H, S, D]
-        let q = q.reshape((b, seq, self.heads, self.dim_head))?.transpose(1, 2)?;
-        let k = k.reshape((b, seq, self.heads, self.dim_head))?.transpose(1, 2)?;
+        // Reshape to [B, H, S, D]; Q/K RMSNorm before the transpose, where the
+        // input is contiguous and candle uses its fused kernel.
+        let q = q.reshape((b, seq, self.heads, self.dim_head))?.apply(&self.norm_q)?.transpose(1, 2)?;
+        let k = k.reshape((b, seq, self.heads, self.dim_head))?.apply(&self.norm_k)?.transpose(1, 2)?;
         let v = v.reshape((b, seq, self.heads, self.dim_head))?.transpose(1, 2)?.contiguous()?; // Metal matmul needs contiguous operands
-        
-        // Apply Q/K normalization
-        let q = q.apply(&self.norm_q)?;
-        let k = k.apply(&self.norm_k)?;
         
         // Apply RoPE
         let q = apply_rope(&q, pe)?;
@@ -311,10 +308,12 @@ impl Modulation {
 /// Create a fixed LayerNorm (ones weight, no bias, no learnable params).
 /// Qwen-Image-2.1 uses elementwise_affine=False LayerNorm in blocks and final layer.
 fn fixed_layer_norm(dim: usize, device: &Device, dtype: DType) -> Result<LayerNorm> {
-    // candle multiplies the normalized activations by this weight in their own
-    // dtype, so it must match the model dtype (BF16 runs would fail otherwise).
+    // Weight and bias in the model dtype. The zero bias is not decoration:
+    // candle only uses its fused layer-norm kernel when a bias is present, and
+    // the unfused fallback (~8 kernels per call) was a large share of step time.
     let ws = Tensor::ones(dim, dtype, device)?;
-    Ok(LayerNorm::new_no_bias(ws, 1e-6))
+    let bias = Tensor::zeros(dim, dtype, device)?;
+    Ok(LayerNorm::new(ws, bias, 1e-6))
 }
 
 /// Single-stream Transformer block for Qwen-Image-2.1.
