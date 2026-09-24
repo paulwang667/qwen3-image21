@@ -72,8 +72,9 @@ struct Args {
     #[arg(long)]
     vae_path: Option<String>,
 
-    /// Text encoder model directory (must contain config.json, model.safetensors,
-    /// and tokenizer.json for a standard dense Qwen3 model — see text_encoder.rs)
+    /// Text encoder directory: the official repo's `text_encoder/` (tokenizer
+    /// read from the sibling `processor/`), or a dense Qwen3 stand-in — see
+    /// text_encoder.rs. Omit for random embeddings.
     #[arg(long)]
     text_encoder_path: Option<String>,
 
