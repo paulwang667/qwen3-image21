@@ -29,9 +29,19 @@ struct Args {
     #[arg(long, default_value_t = 1024)]
     width: usize,
 
-    /// Number of inference steps
-    #[arg(long, default_value_t = 50)]
+    /// Number of inference steps (upstream QwenImage21Pipeline default: 40)
+    #[arg(long, default_value_t = 40)]
     steps: usize,
+
+    /// Negative prompt for true classifier-free guidance (only used when
+    /// --true-cfg-scale > 1, as upstream)
+    #[arg(long)]
+    negative_prompt: Option<String>,
+
+    /// True CFG scale. Qwen-Image-2.1 is meant to be sampled without guidance,
+    /// hence the upstream default of 1.0 (off).
+    #[arg(long, default_value_t = 1.0)]
+    true_cfg_scale: f32,
 
     /// Use quantized model
     #[arg(long)]
@@ -77,7 +87,10 @@ fn load_transformer(
         eprintln!("  Loading transformer from GGUF (quantized)...");
         let mapped_vb = load_gguf_mapped(model_path, device)?;
         let cfg = TransformerConfig::default();
-        let transformer = QwenImageTransformerQuantized::new(&cfg, mapped_vb.inner().clone())?;
+        // ComfyUI-style conversions (e.g. unsloth's) prefix every tensor name.
+        let vb = mapped_vb.inner().clone();
+        let vb = if vb.contains_key("model.diffusion_model.img_in.weight") { vb.pp("model.diffusion_model") } else { vb };
+        let transformer = QwenImageTransformerQuantized::new(&cfg, vb)?;
         return Ok(TransformerType::Quantized(transformer));
     }
     // safetensors path (non-quantized) — possibly sharded (see resolve_safetensors_paths)
@@ -102,25 +115,26 @@ fn load_vae(vae_path: &str, device: &Device, dtype: DType) -> Result<VaeDecoder>
 fn encode_prompt(
     text_encoder_path: Option<&str>,
     prompt: &str,
+    negative_prompt: Option<&str>,
     device: &Device,
-) -> Result<Tensor> {
+) -> Result<(Tensor, Option<Tensor>)> {
     eprintln!("[Phase 1] Text encoding");
-    let prompt_emb = match text_encoder_path {
+    let embs = match text_encoder_path {
         Some(path) => {
             eprintln!("  Loading text encoder from: {}", path);
-            // Not the real Qwen3-Next text encoder (unimplemented — see
-            // text_encoder.rs); a standard dense Qwen3 stand-in, tiled up to
-            // joint_attention_dim. Dropped when this scope ends.
+            // Dropped when this scope ends.
             let mut encoder = qwen3_image21::text_encoder::TextEncoder::load(path, 4096, device.clone())?;
-            encoder.encode(prompt)?
+            let negative = negative_prompt.map(|p| encoder.encode(p)).transpose()?;
+            (encoder.encode(prompt)?, negative)
         }
         None => {
             eprintln!("  No text encoder path, using random embeddings");
-            Tensor::randn(0.0f32, 1.0f32, (1, 256, 4096), device)? // f32: Metal has no F64 rand_uniform
+            let random = || Tensor::randn(0.0f32, 1.0f32, (1, 256, 4096), device); // f32: Metal has no F64 rand_uniform
+            (random()?, negative_prompt.map(|_| random()).transpose()?)
         }
     };
     eprintln!("  Text encoding done. Encoder released.");
-    Ok(prompt_emb)
+    Ok(embs)
 }
 
 /// Save image tensor [-1,1] to PNG file. The VAE decoder outputs 4 channels
@@ -181,11 +195,20 @@ fn main() -> Result<()> {
     };
 
     // ── Phase 1: Text encoding (load → encode → drop) ──────────────
-    let prompt_emb = encode_prompt(
+    // Upstream enables true CFG only with scale > 1 AND a negative prompt.
+    let do_cfg = args.true_cfg_scale > 1.0 && args.negative_prompt.is_some();
+    if args.true_cfg_scale > 1.0 && args.negative_prompt.is_none() {
+        eprintln!("  --true-cfg-scale > 1 but no --negative-prompt: guidance disabled");
+    } else if args.true_cfg_scale <= 1.0 && args.negative_prompt.is_some() {
+        eprintln!("  --negative-prompt ignored: guidance needs --true-cfg-scale > 1");
+    }
+    let (prompt_emb, negative_emb) = encode_prompt(
         args.text_encoder_path.as_deref(),
         &args.prompt,
+        args.negative_prompt.as_deref().filter(|_| do_cfg),
         &device,
     )?;
+    let guidance = negative_emb.as_ref().map(|neg| (neg, args.true_cfg_scale));
     // Text encoder is dropped here; ~9.5 GB freed.
 
     // ── Phase 2+3: Diffusion ───────────────────────────────────────
@@ -199,7 +222,7 @@ fn main() -> Result<()> {
 
         // Warmup
         eprintln!("Warming up...");
-        let _ = denoise(&transformer, &prompt_emb, args.height, args.width, args.steps, &pipeline_cfg)?;
+        let _ = denoise(&transformer, &prompt_emb, args.height, args.width, args.steps, guidance, &pipeline_cfg)?;
 
         // Timed iterations
         let mut times = Vec::with_capacity(args.benchmark_iterations);
@@ -207,7 +230,7 @@ fn main() -> Result<()> {
         for i in 1..=args.benchmark_iterations {
             eprintln!("Benchmark iteration {}/{}", i, args.benchmark_iterations);
             let start = std::time::Instant::now();
-            let latents = denoise(&transformer, &prompt_emb, args.height, args.width, args.steps, &pipeline_cfg)?;
+            let latents = denoise(&transformer, &prompt_emb, args.height, args.width, args.steps, guidance, &pipeline_cfg)?;
             let img = decode_latents(&vae_decoder, &latents, args.height, args.width, &pipeline_cfg)?;
             let elapsed = start.elapsed();
             times.push(elapsed);
@@ -238,7 +261,7 @@ fn main() -> Result<()> {
 
         eprintln!("  Denoising ({} steps)...", args.steps);
         let start = std::time::Instant::now();
-        let latents = denoise(&transformer, &prompt_emb, args.height, args.width, args.steps, &pipeline_cfg)?;
+        let latents = denoise(&transformer, &prompt_emb, args.height, args.width, args.steps, guidance, &pipeline_cfg)?;
         eprintln!("  Denoising done in {:.2}s", start.elapsed().as_secs_f32());
 
         // Debug hook: dump the real packed latents for offline VAE diagnostics

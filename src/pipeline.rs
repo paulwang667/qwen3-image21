@@ -59,6 +59,7 @@ pub fn denoise(
     height: usize,
     width: usize,
     num_inference_steps: usize,
+    guidance: Option<(&Tensor, f32)>,
     cfg: &PipelineConfig,
 ) -> Result<Tensor> {
     let batch_size = prompt_emb.dim(0)?;
@@ -73,6 +74,11 @@ pub fn denoise(
     let latents = Tensor::randn(0.0f32, 1.0f32, shape, &cfg.device)?;
     let mut packed_latents = pack_latents(&latents)?.to_dtype(cfg.dtype)?;
     let prompt_emb = prompt_emb.to_dtype(cfg.dtype)?;
+    // Optional true CFG: `(negative_prompt_emb, true_cfg_scale)`.
+    let guidance = match guidance {
+        Some((neg, scale)) => Some((neg.to_dtype(cfg.dtype)?, scale)),
+        None => None,
+    };
 
     // Resolution-dependent shifted sigma schedule (see scheduler::FlowMatchEuler docs) —
     // image_seq_len is the packed latent's token count (patch_size=1, so latent_h*latent_w).
@@ -107,6 +113,17 @@ pub fn denoise(
             &packed_latents, &timestep, &prompt_emb, None, &img_ids, &txt_ids,
             height, width,
         )?;
+        // Upstream QwenImage21Pipeline: neg + scale * (cond - neg), no rescaling.
+        let noise_pred = match &guidance {
+            Some((neg_emb, scale)) => {
+                let neg_pred = transformer.forward(
+                    &packed_latents, &timestep, neg_emb, None, &img_ids, &txt_ids,
+                    height, width,
+                )?;
+                (&neg_pred + ((&noise_pred - &neg_pred)? * *scale as f64)?)?
+            }
+            None => noise_pred,
+        };
 
         if i == 0 {
             eprintln!("  noise_pred shape: {:?}", noise_pred.shape());

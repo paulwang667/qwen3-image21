@@ -42,7 +42,9 @@ struct QTextEmbedder {
 
 impl QTextEmbedder {
     fn new(cfg: &Config, vb: VarBuilder) -> Result<Self> {
-        let text_norm = RmsNorm::new(vb.get(cfg.hidden_size(), "text_norm.weight")?.dequantize(vb.device())?, 1e-6);
+        // ZeroCenterRMSNorm: the checkpoint stores `scale - 1`, so add 1 back.
+        let text_norm_weight = (vb.get(cfg.hidden_size(), "text_norm.weight")?.dequantize(vb.device())? + 1.0)?;
+        let text_norm = RmsNorm::new(text_norm_weight, 1e-6);
         let in_layer = qnn::linear_b(cfg.joint_attention_dim, cfg.hidden_size(), false, vb.pp("in_layer"))?;
         let out_layer = qnn::linear_b(cfg.hidden_size(), cfg.hidden_size(), false, vb.pp("out_layer"))?;
         Ok(Self { text_norm, in_layer, out_layer })
@@ -201,11 +203,20 @@ impl Attention {
     }
 }
 
-/// Quantized gated MLP (SwiGLU).
+/// Quantized gated MLP (SwiGLU): `out(silu(gate_layer(x)) * proj(x))`.
+#[derive(Debug, Clone)]
+enum MlpInput {
+    Separate { proj: Linear, gate_layer: Linear },
+    /// ComfyUI-style conversions (e.g. unsloth's GGUFs) fuse both into one
+    /// `gate_up` matmul whose output is `[gate; up]` (ComfyUI's `_swiglu_eager`
+    /// chunks it that way), so the fused weight is kept quantized and only the
+    /// activation is split.
+    FusedGateUp(Linear),
+}
+
 #[derive(Debug, Clone)]
 struct GatedMlp {
-    proj: Linear,
-    gate_layer: Linear,
+    input: MlpInput,
     out: Linear,
 }
 
@@ -214,16 +225,29 @@ impl GatedMlp {
         let hidden = cfg.hidden_size();
         let mlp_hidden = cfg.mlp_hidden_size();
 
-        let proj = qnn::linear_b(hidden, mlp_hidden, false, vb.pp("proj"))?;
-        let gate_layer = qnn::linear_b(hidden, mlp_hidden, false, vb.pp("gate_layer"))?;
+        // Not `contains_key`: candle's quantized VarBuilder ignores the `pp` prefix there.
+        let input = if vb.get_no_shape("gate_up.weight").is_ok() {
+            MlpInput::FusedGateUp(qnn::linear_b(hidden, 2 * mlp_hidden, false, vb.pp("gate_up"))?)
+        } else {
+            MlpInput::Separate {
+                proj: qnn::linear_b(hidden, mlp_hidden, false, vb.pp("proj"))?,
+                gate_layer: qnn::linear_b(hidden, mlp_hidden, false, vb.pp("gate_layer"))?,
+            }
+        };
         let out = qnn::linear_b(mlp_hidden, hidden, false, vb.pp("out"))?;
 
-        Ok(Self { proj, gate_layer, out })
+        Ok(Self { input, out })
     }
 
     fn forward(&self, x: &Tensor) -> Result<Tensor> {
-        let proj = x.apply(&self.proj)?;
-        let gate = x.apply(&self.gate_layer)?;
+        let (gate, proj) = match &self.input {
+            MlpInput::Separate { proj, gate_layer } => (x.apply(gate_layer)?, x.apply(proj)?),
+            MlpInput::FusedGateUp(gate_up) => {
+                let gu = x.apply(gate_up)?;
+                let half = gu.dim(D::Minus1)? / 2;
+                (gu.narrow(D::Minus1, 0, half)?, gu.narrow(D::Minus1, half, half)?)
+            }
+        };
         let gated = gate.silu()?.broadcast_mul(&proj)?;
         gated.apply(&self.out)
     }
@@ -278,7 +302,7 @@ impl TransformerBlock {
     }
 
     fn forward(&self, x: &Tensor, modulation: &Tensor, pe: &Tensor, attention_mask: Option<&Tensor>, _modulation_row_indices: Option<&Tensor>) -> Result<Tensor> {
-        // Slice modulation: [scale1, gate1, scale2, gate2]
+        // Per-token modulation [B, seq, 4*hidden] -> [scale1, gate1, scale2, gate2]
         let parts = modulation.chunk(4, D::Minus1)?;
         let scale1 = parts[0].clone();
         let gate1 = parts[1].clone();
@@ -289,19 +313,19 @@ impl TransformerBlock {
 
         // Attention: scale1 * norm1(x), gate1.tanh() * attn
         let normed = self.norm1.forward(x)?;
-        let scale1_u = scale1.unsqueeze(1)?.affine(1.0, 1.0)?;
+        let scale1_u = scale1.affine(1.0, 1.0)?;
         let normed = normed.broadcast_mul(&scale1_u)?;
         let attn_out = self.attn.forward(&normed, pe, attention_mask)?;
-        let gate1_u = gate1.tanh()?.unsqueeze(1)?;
+        let gate1_u = gate1.tanh()?;
         let attn_out = gate1_u.broadcast_mul(&attn_out)?;
         let x = x.broadcast_add(&attn_out)?;
 
         // MLP: scale2 * norm2(x), gate2.tanh() * mlp
         let normed = self.norm2.forward(&x)?;
-        let scale2_u = scale2.unsqueeze(1)?.affine(1.0, 1.0)?;
+        let scale2_u = scale2.affine(1.0, 1.0)?;
         let normed = normed.broadcast_mul(&scale2_u)?;
         let mlp_out = self.mlp.forward(&normed)?;
-        let gate2_u = gate2.tanh()?.unsqueeze(1)?;
+        let gate2_u = gate2.tanh()?;
         let mlp_out = gate2_u.broadcast_mul(&mlp_out)?;
         let x = x.broadcast_add(&mlp_out)?;
 
@@ -318,7 +342,7 @@ impl TransformerBlock {
         _modulation_row_indices: Option<&Tensor>,
         kv_caches: &mut [crate::transformer::KVCache],
     ) -> Result<Tensor> {
-        // Slice modulation: [scale1, gate1, scale2, gate2]
+        // Per-token modulation [B, seq, 4*hidden] -> [scale1, gate1, scale2, gate2]
         let parts = modulation.chunk(4, D::Minus1)?;
         let scale1 = parts[0].clone();
         let gate1 = parts[1].clone();
@@ -327,7 +351,7 @@ impl TransformerBlock {
 
         // Attention: scale1 * norm1(x), gate1.tanh() * attn
         let normed = self.norm1.forward(x)?;
-        let scale1_u = scale1.unsqueeze(1)?.affine(1.0, 1.0)?;
+        let scale1_u = scale1.affine(1.0, 1.0)?;
         let normed = normed.broadcast_mul(&scale1_u)?;
 
         let attn_out = if let Some(cache) = kv_caches.get_mut(0) {
@@ -336,16 +360,16 @@ impl TransformerBlock {
             self.attn.forward_cached(&normed, pe, attention_mask, None)?
         };
 
-        let gate1_u = gate1.tanh()?.unsqueeze(1)?;
+        let gate1_u = gate1.tanh()?;
         let attn_out = gate1_u.broadcast_mul(&attn_out)?;
         let x = x.broadcast_add(&attn_out)?;
 
         // MLP: scale2 * norm2(x), gate2.tanh() * mlp
         let normed = self.norm2.forward(&x)?;
-        let scale2_u = scale2.unsqueeze(1)?.affine(1.0, 1.0)?;
+        let scale2_u = scale2.affine(1.0, 1.0)?;
         let normed = normed.broadcast_mul(&scale2_u)?;
         let mlp_out = self.mlp.forward(&normed)?;
-        let gate2_u = gate2.tanh()?.unsqueeze(1)?;
+        let gate2_u = gate2.tanh()?;
         let mlp_out = gate2_u.broadcast_mul(&mlp_out)?;
         let x = x.broadcast_add(&mlp_out)?;
 
@@ -392,12 +416,37 @@ pub struct QwenImageTransformerQuantized {
 }
 
 impl QwenImageTransformerQuantized {
+    /// `causal_condition` modulation `[B, seq_txt + seq_img, 4*hidden]`: text
+    /// tokens read a row computed at t=0, image tokens the real timestep's row.
+    /// See `QwenImageTransformer::forward` for the non-quantized equivalent.
+    fn per_token_modulation(&self, t_emb: &Tensor, seq_txt: usize, seq_img: usize, dtype: DType) -> Result<Tensor> {
+        let batch = t_emb.dim(0)?;
+        let width = 4 * self.cfg.hidden_size();
+        let real = self.modulation.forward(t_emb)?.unsqueeze(1)?.broadcast_as((batch, seq_img, width))?.contiguous()?;
+        if seq_txt == 0 {
+            return Ok(real);
+        }
+        // t=0 sinusoidal embedding is the constant [cos(0)=1.., sin(0)=0..] (dim 256).
+        let zero_sinusoidal = Tensor::cat(
+            &[Tensor::ones((1, 128), dtype, &self.device)?, Tensor::zeros((1, 128), dtype, &self.device)?],
+            D::Minus1,
+        )?;
+        let zero = self
+            .modulation
+            .forward(&self.time_text_embed.forward(&zero_sinusoidal)?)?
+            .unsqueeze(1)?
+            .broadcast_as((batch, seq_txt, width))?
+            .contiguous()?;
+        Tensor::cat(&[&zero, &real], 1)
+    }
+
     pub fn new(cfg: &Config, vb: VarBuilder) -> Result<Self> {
         let device = vb.device().clone();
 
         let img_in = qnn::linear_b(cfg.in_channels, cfg.hidden_size(), false, vb.pp("img_in"))?;
 
-        let txt_in = if vb.contains_key("txt_in.in_layer.weight") {
+        // Not `contains_key`: candle's quantized VarBuilder ignores the `pp` prefix there.
+        let txt_in = if vb.get_no_shape("txt_in.in_layer.weight").is_ok() {
             Some(QTextEmbedder::new(cfg, vb.pp("txt_in"))?)
         } else {
             None
@@ -460,8 +509,7 @@ impl QwenImageTransformerQuantized {
         // Timestep
         let t_emb = self.time_text_embed.forward(timestep)?;
 
-        // Global modulation (shared across all blocks)
-        let modulation = self.modulation.forward(&t_emb)?;
+        let modulation = self.per_token_modulation(&t_emb, seq_txt, seq_img, x.dtype())?;
         eprintln!("  [quantized forward] modulation.shape={:?}, x.shape={:?}", modulation.shape(), x.shape());
 
         // RoPE using new QwenImage21Rope API
@@ -561,8 +609,7 @@ impl QwenImageTransformerQuantized {
         // Timestep
         let t_emb = self.time_text_embed.forward(timestep)?;
 
-        // Global modulation (shared across all blocks)
-        let modulation = self.modulation.forward(&t_emb)?;
+        let modulation = self.per_token_modulation(&t_emb, seq_txt, seq_img, x.dtype())?;
 
         // RoPE using new QwenImage21Rope API
         let image_pad_mask: Vec<u8> = vec![0u8; seq_txt].into_iter()
