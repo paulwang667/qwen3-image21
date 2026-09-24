@@ -426,18 +426,65 @@ impl VaeDecoder {
     }
 
     /// Decode latents `[B, z_dim, H, W]` to pixels `[B, out_channels, H*16, W*16]`.
+    ///
+    /// Everything after the mid-block (whose attention is global) is spatially
+    /// local, so each up-block runs over row bands (see [`in_row_bands`]): the
+    /// full-resolution intermediates never exist for the whole image at once.
     pub fn decode(&self, latents: &Tensor) -> Result<Tensor> {
         let mut x = latents.apply(&self.post_quant_conv)?;
         x = conv2d_banded(&x, &self.conv_in)?;
         x = self.mid_block.forward(&x)?;
-        for up_block in &self.up_blocks {
-            x = up_block.forward(&x)?;
+        let last = self.up_blocks.len() - 1;
+        for (i, up_block) in self.up_blocks.iter().enumerate() {
+            let scale = if up_block.upsampler.is_some() { 2 } else { 1 };
+            let (_, c_in, _, w_in) = x.dims4()?;
+            let bytes_per_row = c_in.max(up_block.out_dim) * w_in * scale * scale * x.dtype().size_in_bytes();
+            let band = (UP_BAND_BUDGET_BYTES / bytes_per_row).max(1);
+            x = in_row_bands(&x, UP_BLOCK_HALO_ROWS, scale, band, |band_x| {
+                let y = up_block.forward(band_x)?;
+                if i == last { conv2d_banded(&self.norm_out.forward(&y)?.silu()?, &self.conv_out) } else { Ok(y) }
+            })?;
         }
-        x = self.norm_out.forward(&x)?;
-        x = x.silu()?;
-        x = conv2d_banded(&x, &self.conv_out)?;
         x.clamp(-1.0f64, 1.0f64)
     }
+}
+
+/// Receptive radius of one up-block, in its input rows: 3 residual blocks of
+/// two 3x3 convs (6 rows), plus the resample conv after the 2x upsample (half
+/// a row) or, for the last block, the 3x3 `conv_out` head (1 row).
+const UP_BLOCK_HALO_ROWS: usize = 7;
+
+/// Target size of one up-block band's largest tensor.
+const UP_BAND_BUDGET_BYTES: usize = 256 << 20;
+
+/// `f(x)` for a spatially local `f` whose output has `scale`x the input's rows
+/// and a receptive radius of at most `halo` input rows, computed over
+/// horizontal bands of `band` rows (each extended by `halo` rows on both sides
+/// where the image continues). Exact: cutting the input only perturbs output
+/// rows within the halo, which are dropped; at the true image edges `f` sees
+/// the same zero padding as on the whole image. Bands are written into one
+/// preallocated output, so only one band's intermediates are alive at a time.
+fn in_row_bands(x: &Tensor, halo: usize, scale: usize, band: usize, f: impl Fn(&Tensor) -> Result<Tensor>) -> Result<Tensor> {
+    let h = x.dim(2)?;
+    if band >= h {
+        return f(x);
+    }
+    let mut out: Option<Tensor> = None;
+    for r0 in (0..h).step_by(band) {
+        let r1 = (r0 + band).min(h);
+        let (s0, s1) = (r0.saturating_sub(halo), (r1 + halo).min(h));
+        let y = f(&x.narrow(2, s0, s1 - s0)?)?;
+        let piece = y.narrow(2, (r0 - s0) * scale, (r1 - r0) * scale)?.contiguous()?;
+        let out = match &out {
+            Some(o) => o,
+            None => {
+                let (b, c, _, w) = piece.dims4()?;
+                out.insert(Tensor::zeros((b, c, h * scale, w), piece.dtype(), piece.device())?)
+            }
+        };
+        out.slice_set(&piece, 2, r0 * scale)?;
+    }
+    Ok(out.expect("h > band >= 1, so at least one band ran"))
 }
 
 /// `QwenImage21AvgDown3D` for a single frame: space-to-depth by `factor_s`,
@@ -618,10 +665,29 @@ mod tests {
     use candle_core::Device;
     use candle_nn::VarMap;
 
-    /// Builds against a small config so the smoke test runs fast on CPU, but keeps
-    /// the same dim_mult/z_dim ratios; this exercises tensor-name wiring and the
-    /// channel/spatial arithmetic through every up_block (equal-channel, channel-
-    /// reducing, and the final no-upsample block) without needing a real checkpoint.
+    /// Row-banded evaluation of a local op must equal evaluating it whole, for
+    /// bands down to a single row and a final band shorter than the others.
+    #[test]
+    fn test_in_row_bands_matches_whole() {
+        // A local op with radius 2 input rows and 2x row upsampling: two 3x3
+        // convs around a nearest upsample (radius 1 + 1/2 -> rounded to 2).
+        let dev = Device::Cpu;
+        let w1 = Tensor::randn(0f32, 1.0, (3, 2, 3, 3), &dev).unwrap();
+        let w2 = Tensor::randn(0f32, 1.0, (2, 3, 3, 3), &dev).unwrap();
+        let f = |x: &Tensor| -> Result<Tensor> {
+            let y = x.conv2d(&w1, 1, 1, 1, 1)?.silu()?;
+            let (h, w) = (y.dim(2)? * 2, y.dim(3)? * 2);
+            y.upsample_nearest2d(h, w)?.conv2d(&w2, 1, 1, 1, 1)
+        };
+        let x = Tensor::randn(0f32, 1.0, (1, 2, 13, 5), &dev).unwrap();
+        let want = f(&x).unwrap();
+        for band in [1, 3, 4, 12] {
+            let got = in_row_bands(&x, 2, 2, band, f).unwrap();
+            let diff = (&got - &want).unwrap().abs().unwrap().max_all().unwrap().to_scalar::<f32>().unwrap();
+            assert!(diff < 1e-5, "band {band}: max diff {diff}");
+        }
+    }
+
     /// Banded convolution must equal the direct one (same weights and padding),
     /// including a final band shorter than the others.
     #[test]
@@ -639,6 +705,10 @@ mod tests {
         assert!(diff < 1e-5, "max diff {diff}");
     }
 
+    /// Builds against a small config so the smoke test runs fast on CPU, but keeps
+    /// the same dim_mult/z_dim ratios; this exercises tensor-name wiring and the
+    /// channel/spatial arithmetic through every up_block (equal-channel, channel-
+    /// reducing, and the final no-upsample block) without needing a real checkpoint.
     #[test]
     fn test_decoder_shapes() {
         let device = Device::Cpu;
