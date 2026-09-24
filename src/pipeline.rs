@@ -25,7 +25,6 @@ impl TransformerType {
         height: usize,
         width: usize,
     ) -> Result<Tensor> {
-        eprintln!("  [TransformerType::forward] variant: {:?}", match self { TransformerType::NonQuantized(_) => "NonQuantized", TransformerType::Quantized(_) => "Quantized" });
         match self {
             Self::NonQuantized(t) => t.forward(latents, Some(text_emb), text_emb_mask, timestep, img_ids, txt_ids, height, width),
             Self::Quantized(t) => t.forward(latents, Some(text_emb), text_emb_mask, timestep, img_ids, txt_ids, height, width),

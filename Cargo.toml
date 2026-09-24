@@ -18,6 +18,9 @@ tokenizers = "0.21"
 rand = "0.9"
 rand_distr = "0.5"
 candle-flash-attn = { version = "0.11", optional = true }
+tokio = { version = "1", features = ["full"], optional = true }
+axum = { version = "0.8", features = ["multipart"], optional = true }
+base64 = { version = "0.22", optional = true }
 
 [features]
 default = []
@@ -29,3 +32,4 @@ cuda = ["candle-core/cuda", "candle-nn/cuda", "candle-transformers/cuda"]
 # FlashAttention v2 for unmasked attention (`--flash-attn`). CUDA only, sm80+;
 # compiles the flash-attn kernels with nvcc (slow first build).
 flash-attn = ["cuda", "dep:candle-flash-attn"]
+server = ["dep:tokio", "dep:axum", "dep:base64"]

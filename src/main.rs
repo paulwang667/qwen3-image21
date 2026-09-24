@@ -1,21 +1,19 @@
 use anyhow::{Error as E, Result};
-use candle_core::{Device, DType, IndexOp, Tensor};
-use candle_nn::VarBuilder;
+use candle_core::{Device, DType};
 use clap::Parser;
 
-use qwen3_image21::pipeline::{ConditionLatents, PipelineConfig, PromptEmbeds, TransformerType, denoise, decode_latents};
-use qwen3_image21::transformer::{Config as TransformerConfig, QwenImageTransformer};
-use qwen3_image21::vae::{Config as VaeConfig, VaeDecoder};
-use qwen3_image21::gguf_mapped::load_gguf_mapped;
-use qwen3_image21::quantized_transformer::QwenImageTransformerQuantized;
+use qwen3_image21::pipeline::{denoise, decode_latents, PipelineConfig};
+use qwen3_image21::service::{self, EngineConfig, GenRequest, ConditionImageInput, ModelPaths};
+use qwen3_image21::transformer::set_flash_attention;
+use qwen3_image21::vae::Config as VaeConfig;
 use qwen3_image21::Precision;
 
 #[derive(Parser)]
-#[command(author, version, about = "Qwen-Image-2.1 Quantized Inference Engine")]
+#[command(author, version, about = "Qwen-Image-2.1 Inference Engine")]
 struct Args {
-    /// Prompt for image generation
+    /// Prompt for image generation (not needed in --serve mode)
     #[arg(long)]
-    prompt: String,
+    prompt: Option<String>,
 
     /// Output image file
     #[arg(long, default_value = "output.png")]
@@ -66,10 +64,6 @@ struct Args {
     #[arg(long)]
     kv_cache_cpu: bool,
 
-    /// Use quantized model
-    #[arg(long)]
-    quantized: bool,
-
     /// Weight/compute precision of the full-precision transformer and of the
     /// text encoder on the GPU. GGUF transformers always compute in F32 and the
     /// VAE always runs in F32.
@@ -77,7 +71,7 @@ struct Args {
     precision: Precision,
 
     /// Run the text encoder (and vision tower) on the CPU in F32 instead of the
-    /// GPU. On the GPU its layers are already streamed (~4 GB BF16 / ~6 GB F32
+    /// GPU. On a GPU its layers are already streamed (~4 GB BF16 / ~6 GB F32
     /// peak), so this only helps when even that does not fit; ~15x slower.
     #[arg(long)]
     text_encoder_cpu: bool,
@@ -90,7 +84,7 @@ struct Args {
     tf32: bool,
 
     /// Use FlashAttention v2 for unmasked attention (all steps after the first
-    /// with the KV cache). Needs a build with `--features flash-attn`; F32
+    /// with the KV cache). Needs a build with --features flash-attn; F32
     /// inputs are cast to F16 for the kernel.
     #[arg(long)]
     flash_attn: bool,
@@ -131,173 +125,54 @@ struct Args {
     /// the identical starting noise locks the edit onto the original.
     #[arg(long)]
     seed: Option<u64>,
-}
 
-fn load_transformer(
-    model_path: &str,
-    device: &Device,
-    quantized: bool,
-    dtype: DType,
-) -> Result<TransformerType> {
-    if model_path.ends_with(".gguf") {
-        eprintln!("  Loading transformer from GGUF (quantized)...");
-        let mapped_vb = load_gguf_mapped(model_path, device)?;
-        let cfg = TransformerConfig::default();
-        // ComfyUI-style conversions (e.g. unsloth's) prefix every tensor name.
-        let vb = mapped_vb.inner().clone();
-        let vb = if vb.contains_key("model.diffusion_model.img_in.weight") { vb.pp("model.diffusion_model") } else { vb };
-        let transformer = QwenImageTransformerQuantized::new(&cfg, vb)?;
-        return Ok(TransformerType::Quantized(transformer));
-    }
-    // safetensors path (non-quantized) — possibly sharded (see resolve_safetensors_paths)
-    let paths = qwen3_image21::safetensors_util::resolve_safetensors_paths(model_path)?;
-    eprintln!("  Loading transformer from {} safetensors shard(s) (dtype={:?})...", paths.len(), dtype);
-    let vb = unsafe { VarBuilder::from_mmaped_safetensors(&paths, dtype, device)? };
-    let cfg = TransformerConfig::default();
-    let transformer = QwenImageTransformer::new(&cfg, vb)?;
-    Ok(TransformerType::NonQuantized(transformer))
-}
+    // ── Server mode ────────────────────────────────────────────────────
 
-fn load_vae(vae_path: &str, device: &Device, dtype: DType) -> Result<VaeDecoder> {
-    let cfg = VaeConfig::default();
-    let vb = unsafe { VarBuilder::from_mmaped_safetensors(&[vae_path.to_string()], dtype, device)? };
-    Ok(VaeDecoder::new(&cfg, vb)?)
-}
+    /// Start HTTP server (OpenAI-compatible image API) instead of a single
+    /// generation. Build with --features server.
+    #[arg(long)]
+    serve: bool,
 
+    /// HTTP server port (only with --serve)
+    #[arg(long, default_value_t = 8080)]
+    port: u16,
 
-/// Phase 1: Text encoding.
-/// Loads the text encoder, encodes the prompt (with any condition images), then
-/// drops the model. The returned tensors are independent of the model.
-fn encode_prompt(
-    text_encoder_path: Option<&str>,
-    prompt: &str,
-    negative_prompt: Option<&str>,
-    images: &[qwen3_image21::condition_image::ConditionImage],
-    device: &Device,
-    encoder_device: &Device,
-    encoder_dtype: DType,
-) -> Result<(PromptEmbeds, Option<PromptEmbeds>)> {
-    eprintln!("[Phase 1] Text encoding");
-    let start = std::time::Instant::now();
-    let embs = match text_encoder_path {
-        Some(path) => {
-            eprintln!("  Loading text encoder from: {} ({:?} on {:?})", path, encoder_dtype, encoder_device);
-            // Dropped when this scope ends.
-            // On a GPU the language-model layers are streamed in one at a time:
-            // same speed (loading dominates either way) and bit-identical output,
-            // at ~4 GB of GPU memory instead of ~17 GB (BF16) / ~34 GB (F32).
-            let mut encoder = if !encoder_device.is_cpu() {
-                qwen3_image21::text_encoder::TextEncoder::load_streamed(path, 4096, encoder_device.clone(), encoder_dtype)?
-            } else {
-                qwen3_image21::text_encoder::TextEncoder::load(path, 4096, encoder_device.clone(), encoder_dtype)?
-            };
-            let mut encode = |p: &str| -> Result<PromptEmbeds> {
-                let (embeds, image_slots) = if images.is_empty() {
-                    (encoder.encode(p)?, None)
-                } else {
-                    // Upstream encodes the negative prompt with the same condition images.
-                    let (embeds, slots) = encoder.encode_with_images(p, images)?;
-                    (embeds, Some(slots))
-                };
-                Ok(PromptEmbeds { embeds: embeds.to_device(device)?, image_slots })
-            };
-            let negative = negative_prompt.map(&mut encode).transpose()?;
-            (encode(prompt)?, negative)
-        }
-        None => {
-            if !images.is_empty() {
-                return Err(E::msg("--image needs --text-encoder-path (the vision tower is part of the text encoder)"));
-            }
-            eprintln!("  No text encoder path, using random embeddings");
-            let random = || -> Result<PromptEmbeds> {
-                // f32: Metal has no F64 rand_uniform
-                Ok(PromptEmbeds { embeds: Tensor::randn(0.0f32, 1.0f32, (1, 256, 4096), device)?, image_slots: None })
-            };
-            (random()?, negative_prompt.map(|_| random()).transpose()?)
-        }
-    };
-    release_freed_memory(device)?;
-    eprintln!("  Text encoding done in {:.2}s. Encoder released.", start.elapsed().as_secs_f32());
-    Ok(embs)
-}
-
-/// VAE-encodes the condition images into packed latents for the transformer.
-fn encode_condition_images(
-    vae_path: &str,
-    images: &[qwen3_image21::condition_image::ConditionImage],
-    device: &Device,
-) -> Result<ConditionLatents> {
-    eprintln!("[Phase 1b] Encoding {} condition image(s) with the VAE", images.len());
-    let vb = unsafe { VarBuilder::from_mmaped_safetensors(&[vae_path.to_string()], DType::F32, device)? };
-    let encoder = qwen3_image21::vae::VaeEncoder::new(&VaeConfig::default(), vb)?;
-    let mut packed = Vec::with_capacity(images.len());
-    let mut shapes = Vec::with_capacity(images.len());
-    for img in images {
-        let latents = encoder.encode(&img.vae_input)?; // [1, 64, h, w]
-        let (_, _, h, w) = latents.dims4()?;
-        packed.push(qwen3_image21::vae::pack_latents(&latents.unsqueeze(2)?)?);
-        shapes.push((h, w));
-    }
-    let latents = Tensor::cat(&packed, 1)?;
-    drop(encoder);
-    release_freed_memory(device)?;
-    Ok(ConditionLatents { latents, shapes })
-}
-
-/// candle's CUDA backend allocates from stream-ordered memory pools, which keep
-/// freed memory reserved until the next device synchronize. Without this, a
-/// dropped model's memory stays reserved, and the next model's large buffers
-/// don't fit into its fragmented blocks, so the phases' peaks add up (measured:
-/// the transformer's 17 GB stayed reserved under the VAE decode's 10 GB).
-fn release_freed_memory(device: &Device) -> Result<()> {
-    Ok(device.synchronize()?)
-}
-
-/// Save image tensor [-1,1] to PNG file. The VAE decoder outputs 4 channels
-/// (RGBA, per the real checkpoint's `conv_out` weight shape `[4, 144, 3, 3]`),
-/// so the alpha channel must be dropped before handing bytes to an Rgb image
-/// buffer — `ImageBuffer::from_vec` only checks the buffer is at least
-/// width*height*3 bytes, not exactly, so an un-dropped 4th channel is silently
-/// accepted and misread at the wrong stride, producing a periodic stripe artifact.
-fn save_image(image: &Tensor, width: usize, height: usize, output: &str) -> Result<()> {
-    let image = image.clamp(-1.0, 1.0)?;
-    let image = image.affine(0.5, 0.5)?;   // (x + 1) * 0.5
-    let image = image.affine(255.0, 0.0)?; // * 255
-    let image = image.to_dtype(candle_core::DType::U8)?;
-    let image = image.i(0)?;               // [C, H, W]
-    let image = image.permute((1, 2, 0))?; // [H, W, C]
-
-    let channels = image.dim(2)?;
-    let pixels = image.flatten_all()?.to_vec1::<u8>().unwrap();
-    let rgb: Vec<u8> = pixels.chunks(channels).flat_map(|px| [px[0], px[1], px[2]]).collect();
-
-    let img: image::ImageBuffer<image::Rgb<u8>, Vec<u8>> =
-        image::ImageBuffer::from_vec(width as u32, height as u32, rgb).unwrap();
-    img.save(output)?;
-    println!("Image saved to: {}", output);
-    Ok(())
+    /// Comma-separated GPU device IDs for multi-GPU parallelism (only with
+    /// --serve). Default: 0 (single GPU).
+    #[arg(long)]
+    device_ids: Option<String>,
 }
 
 fn main() -> Result<()> {
     let args = Args::parse();
-    // Cargo.toml's "metal"/"cuda" features are opt-in per build (`cargo build
-    // --features metal` on macOS, `--features cuda` on Linux/NVIDIA); whichever
-    // wasn't compiled in has its is_available() check compile down to `false`,
-    // so trying both here is safe regardless of which one this binary has.
+
+    // ── Server mode ────────────────────────────────────────────────────
+    if args.serve {
+        return run_server(&args);
+    }
+
+    // ── CLI mode ───────────────────────────────────────────────────────
+    let prompt = args.prompt.as_deref().ok_or_else(|| {
+        E::msg("--prompt is required (or use --serve for server mode)")
+    })?;
+
     let device = match Device::cuda_if_available(0)? {
         Device::Cpu => Device::metal_if_available(0)?,
         d => d,
     };
     let dtype = args.precision.as_dtype();
+    if args.tf32 && !device.is_cuda() {
+        eprintln!("  --tf32 has no effect on {:?} (CUDA-only)", device);
+    }
     candle_core::cuda::set_gemm_reduced_precision_f32(args.tf32);
-    qwen3_image21::transformer::set_flash_attention(args.flash_attn)?;
+    set_flash_attention(args.flash_attn)?;
+    if args.kv_cache_cpu && device.is_metal() {
+        eprintln!("  --kv-cache-cpu on Metal: Metal shares unified memory, so the host↔device copy is pure overhead.");
+    }
     qwen3_image21::transformer::set_kv_cache_offload(args.kv_cache_cpu);
 
     eprintln!("Device: {:?}", device);
-    eprintln!("Prompt: {}", args.prompt);
-    // Condition images are resized once, up front; with them the output size
-    // defaults to the last image's size (upstream derives both from the same
-    // `calculate_dimensions(output_resolution², aspect)`).
+    eprintln!("Prompt: {}", prompt);
     let condition_images = args
         .images
         .iter()
@@ -313,48 +188,137 @@ fn main() -> Result<()> {
     let seed = args.seed.unwrap_or_else(rand::random);
     eprintln!("Seed: {seed}");
     eprintln!("Precision: {:?}", args.precision);
-    eprintln!("Quantized: {}", args.quantized);
 
-    let paths = qwen3_image21::model_dir::resolve(
-        std::path::Path::new(&args.model_dir),
+    let paths = ModelPaths::resolve(
+        &args.model_dir,
         args.model_path.as_deref(),
         args.vae_path.as_deref(),
         args.text_encoder_path.as_deref(),
     )?;
-    let model_path = &paths.transformer.to_string_lossy().into_owned();
-    let vae_path = paths.vae.to_string_lossy().into_owned();
-    let vae_path = vae_path.as_str();
-    let text_encoder_path = paths.text_encoder.map(|p| p.to_string_lossy().into_owned());
-    eprintln!("Transformer: {model_path}");
-    eprintln!("VAE: {vae_path}");
-    match &text_encoder_path {
+    eprintln!("Transformer: {}", paths.transformer);
+    eprintln!("VAE: {}", paths.vae);
+    match &paths.text_encoder {
         Some(p) => eprintln!("Text encoder: {p}"),
         None => eprintln!("Text encoder: none found under {} — random embeddings, the output will not follow the prompt", args.model_dir),
     }
 
-    // candle's quantized matmul takes F32 input, so GGUF transformers compute in F32.
-    let transformer_dtype = if model_path.ends_with(".gguf") { DType::F32 } else { dtype };
+    let engine = EngineConfig {
+        precision: args.precision,
+        flash_attn: args.flash_attn,
+        kv_cache_cpu: args.kv_cache_cpu,
+        text_encoder_cpu: args.text_encoder_cpu,
+        tf32: args.tf32,
+    };
+
+    if args.benchmark {
+        return run_benchmark(&args, &paths, &engine, &device, dtype);
+    }
+
+    // Normal CLI mode: delegate to service::generate.
+    let gen_req = GenRequest {
+        prompt: prompt.to_string(),
+        negative_prompt: args.negative_prompt.clone(),
+        true_cfg_scale: args.true_cfg_scale,
+        width: args.width,
+        height: args.height,
+        steps: args.steps,
+        seed: args.seed,
+        images: args.images.iter().map(|s| ConditionImageInput::Path(s.clone())).collect(),
+        output_resolution: args.output_resolution,
+        no_kv_cache: args.no_kv_cache,
+    };
+    let result = service::generate(&gen_req, &paths, &engine, &device)?;
+    std::fs::write(&args.output, &result.png)?;
+    println!("Image saved to: {}", args.output);
+    Ok(())
+}
+
+/// Start the HTTP server.
+fn run_server(args: &Args) -> Result<()> {
+    #[cfg(not(feature = "server"))]
+    {
+        let _ = &args; // suppress unused warning when server feature is off
+        eprintln!("Server mode requires building with --features server");
+        eprintln!("  Example: cargo build --release --features 'metal server'  (macOS)");
+        eprintln!("  Example: cargo build --release --features 'cuda server'   (CUDA)");
+        std::process::exit(1);
+    }
+
+    #[cfg(feature = "server")]
+    {
+        let device_ids = qwen3_image21::server::parse_device_ids(&args.device_ids);
+        let paths = ModelPaths::resolve(
+            &args.model_dir,
+            args.model_path.as_deref(),
+            args.vae_path.as_deref(),
+            args.text_encoder_path.as_deref(),
+        )?;
+        let engine = EngineConfig {
+            precision: args.precision,
+            flash_attn: args.flash_attn,
+            kv_cache_cpu: args.kv_cache_cpu,
+            text_encoder_cpu: args.text_encoder_cpu,
+            tf32: args.tf32,
+        };
+        // Set global settings once before creating workers.
+        candle_core::cuda::set_gemm_reduced_precision_f32(args.tf32);
+        set_flash_attention(args.flash_attn)?;
+        qwen3_image21::transformer::set_kv_cache_offload(args.kv_cache_cpu);
+
+        eprintln!("Transformer: {}", paths.transformer);
+        eprintln!("VAE: {}", paths.vae);
+        match &paths.text_encoder {
+            Some(p) => eprintln!("Text encoder: {p}"),
+            None => eprintln!("Text encoder: none — image-conditioned generation will not be available"),
+        }
+
+        let addr = format!("0.0.0.0:{}", args.port);
+        let rt = tokio::runtime::Runtime::new()?;
+        rt.block_on(qwen3_image21::server::run(&addr, device_ids, paths, engine))?;
+        Ok(())
+    }
+}
+
+/// Benchmark mode: transformer + VAE loaded together for repeated runs.
+fn run_benchmark(
+    args: &Args,
+    paths: &ModelPaths,
+    engine: &EngineConfig,
+    device: &Device,
+    dtype: DType,
+) -> Result<()> {
+    let transformer_dtype = if paths.transformer.ends_with(".gguf") {
+        DType::F32
+    } else {
+        dtype
+    };
     let pipeline_cfg = PipelineConfig {
         vae_cfg: VaeConfig::default(),
         device: device.clone(),
         dtype: transformer_dtype,
     };
-    let (encoder_device, encoder_dtype) = if args.text_encoder_cpu { (Device::Cpu, DType::F32) } else { (device.clone(), dtype) };
+    let (encoder_device, encoder_dtype) = if engine.text_encoder_cpu {
+        (Device::Cpu, DType::F32)
+    } else {
+        (device.clone(), dtype)
+    };
 
-    // ── Phase 1: Text encoding (load → encode → drop) ──────────────
-    // Upstream enables true CFG only with scale > 1 AND a negative prompt.
+    let condition_images = args
+        .images
+        .iter()
+        .map(|p| qwen3_image21::condition_image::load(p, args.output_resolution, device))
+        .collect::<Result<Vec<_>>>()?;
+    let (default_w, default_h) = condition_images.last().map_or((1024, 1024), |c| (c.width, c.height));
+    let (width, height) = (args.width.unwrap_or(default_w), args.height.unwrap_or(default_h));
+    let seed = args.seed.unwrap_or_else(rand::random);
+
     let do_cfg = args.true_cfg_scale > 1.0 && args.negative_prompt.is_some();
-    if args.true_cfg_scale > 1.0 && args.negative_prompt.is_none() {
-        eprintln!("  --true-cfg-scale > 1 but no --negative-prompt: guidance disabled");
-    } else if args.true_cfg_scale <= 1.0 && args.negative_prompt.is_some() {
-        eprintln!("  --negative-prompt ignored: guidance needs --true-cfg-scale > 1");
-    }
-    let (prompt_emb, negative_emb) = encode_prompt(
-        text_encoder_path.as_deref(),
-        &args.prompt,
+    let (prompt_emb, negative_emb) = service::encode_prompt(
+        paths.text_encoder.as_deref(),
+        &args.prompt.clone().unwrap_or_default(),
         args.negative_prompt.as_deref().filter(|_| do_cfg),
         &condition_images,
-        &device,
+        device,
         &encoder_device,
         encoder_dtype,
     )?;
@@ -362,91 +326,72 @@ fn main() -> Result<()> {
     let condition = if condition_images.is_empty() {
         None
     } else {
-        Some(encode_condition_images(vae_path, &condition_images, &device)?)
+        Some(service::encode_condition_images(&paths.vae, &condition_images, device)?)
     };
-    // Text encoder is dropped here; ~9.5 GB freed.
 
-    // ── Phase 2+3: Diffusion ───────────────────────────────────────
-    let image = if args.benchmark {
-        // Benchmark: transformer + VAE loaded together for repeated runs.
-        eprintln!("[Phase 2] Loading transformer...");
-        let transformer = load_transformer(model_path, &device, args.quantized, transformer_dtype)?;
+    eprintln!("[Phase 2] Loading transformer...");
+    let transformer = service::load_transformer(&paths.transformer, device, transformer_dtype)?;
 
-        eprintln!("[Phase 2/3] Loading VAE...");
-        let vae_decoder = load_vae(vae_path, &device, DType::F32)?;
+    eprintln!("[Phase 2/3] Loading VAE...");
+    let vae_decoder = service::load_vae(&paths.vae, device, DType::F32)?;
 
-        // Warmup
-        eprintln!("Warming up...");
-        let _ = denoise(&transformer, &prompt_emb, height, width, args.steps, guidance, condition.as_ref(), !args.no_kv_cache, seed, &pipeline_cfg)?;
+    // Warmup
+    eprintln!("Warming up...");
+    let _ = denoise(
+        &transformer,
+        &prompt_emb,
+        height,
+        width,
+        args.steps,
+        guidance,
+        condition.as_ref(),
+        !args.no_kv_cache,
+        seed,
+        &pipeline_cfg,
+    )?;
 
-        // Timed iterations
-        let mut times = Vec::with_capacity(args.benchmark_iterations);
-        let mut last_image = None;
-        for i in 1..=args.benchmark_iterations {
-            eprintln!("Benchmark iteration {}/{}", i, args.benchmark_iterations);
-            let start = std::time::Instant::now();
-            let latents = denoise(&transformer, &prompt_emb, height, width, args.steps, guidance, condition.as_ref(), !args.no_kv_cache, seed, &pipeline_cfg)?;
-            let img = decode_latents(&vae_decoder, &latents, height, width, &pipeline_cfg)?;
-            let elapsed = start.elapsed();
-            times.push(elapsed);
-            eprintln!("  Time: {:.2}s", elapsed.as_secs_f32());
-            last_image = Some(img);
-        }
-        // Drop both models
-        drop(transformer);
-        drop(vae_decoder);
-        eprintln!("Models released.");
-
-        // Stats
-        let mean = times.iter().map(|t| t.as_secs_f32()).sum::<f32>() / times.len() as f32;
-        let min = times.iter().map(|t| t.as_secs_f32()).fold(f32::MAX, f32::min);
-        let max = times.iter().map(|t| t.as_secs_f32()).fold(f32::MIN, f32::max);
-        let steps_per_sec = args.steps as f32 / mean;
-
-        eprintln!("\n=== Benchmark Results ===");
-        eprintln!("Mean: {:.2}s ({:.2} steps/s)", mean, steps_per_sec);
-        eprintln!("Min:  {:.2}s", min);
-        eprintln!("Max:  {:.2}s", max);
-
-        last_image.ok_or_else(|| E::msg("Benchmark generation failed"))?
-    } else {
-        // Normal mode: load transformer → denoise → drop → load VAE → decode → drop
-        eprintln!("[Phase 2] Loading transformer...");
-        let transformer = load_transformer(model_path, &device, args.quantized, transformer_dtype)?;
-
-        eprintln!("  Denoising ({} steps)...", args.steps);
+    // Timed iterations
+    let mut times = Vec::with_capacity(args.benchmark_iterations);
+    let mut last_image = None;
+    for i in 1..=args.benchmark_iterations {
+        eprintln!("Benchmark iteration {}/{}", i, args.benchmark_iterations);
         let start = std::time::Instant::now();
-        let latents = denoise(&transformer, &prompt_emb, height, width, args.steps, guidance, condition.as_ref(), !args.no_kv_cache, seed, &pipeline_cfg)?;
-        eprintln!("  Denoising done in {:.2}s", start.elapsed().as_secs_f32());
+        let latents = denoise(
+            &transformer,
+            &prompt_emb,
+            height,
+            width,
+            args.steps,
+            guidance,
+            condition.as_ref(),
+            !args.no_kv_cache,
+            seed,
+            &pipeline_cfg,
+        )?;
+        let img = decode_latents(&vae_decoder, &latents, height, width, &pipeline_cfg)?;
+        let elapsed = start.elapsed();
+        times.push(elapsed);
+        eprintln!("  Time: {:.2}s", elapsed.as_secs_f32());
+        last_image = Some(img);
+    }
+    drop(transformer);
+    drop(vae_decoder);
+    eprintln!("Models released.");
 
-        // Debug hook: dump the real packed latents for offline VAE diagnostics
-        // (e.g. checking whether the dup_up3d checkerboard artifact appears on
-        // a genuine denoised latent, not just synthetic test tensors).
-        if let Ok(path) = std::env::var("QWEN_DUMP_LATENTS_PATH") {
-            let tensors = std::collections::HashMap::from([("packed_latents".to_string(), latents.clone())]);
-            candle_core::safetensors::save(&tensors, &path)?;
-            eprintln!("  Dumped packed_latents to {path}");
-        }
+    // Stats
+    let mean = times.iter().map(|t| t.as_secs_f32()).sum::<f32>() / times.len() as f32;
+    let min = times.iter().map(|t| t.as_secs_f32()).fold(f32::MAX, f32::min);
+    let max = times.iter().map(|t| t.as_secs_f32()).fold(f32::MIN, f32::max);
+    let steps_per_sec = args.steps as f32 / mean;
 
-        // Drop transformer before loading VAE — frees ~3.8-6.8 GB.
-        drop(transformer);
-        release_freed_memory(&device)?;
-        eprintln!("  Transformer released.");
+    eprintln!("\n=== Benchmark Results ===");
+    eprintln!("Mean: {:.2}s ({:.2} steps/s)", mean, steps_per_sec);
+    eprintln!("Min:  {:.2}s", min);
+    eprintln!("Max:  {:.2}s", max);
 
-        eprintln!("[Phase 3] Loading VAE...");
-        let vae_decoder = load_vae(vae_path, &device, DType::F32)?;
-
-        eprintln!("  Decoding...");
-        let decode_start = std::time::Instant::now();
-        let image = decode_latents(&vae_decoder, &latents, height, width, &pipeline_cfg)?;
-        eprintln!("  Decoding done in {:.2}s", decode_start.elapsed().as_secs_f32());
-
-        drop(vae_decoder);
-        eprintln!("  VAE released.");
-
-        image
-    };
-
-    save_image(&image, width, height, &args.output)?;
+    let image = last_image.ok_or_else(|| E::msg("Benchmark generation failed"))?;
+    let png = service::image_to_png_bytes(&image, width, height)?;
+    std::fs::write(&args.output, &png)?;
+    println!("Image saved to: {}", args.output);
     Ok(())
 }

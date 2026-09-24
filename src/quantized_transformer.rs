@@ -139,9 +139,7 @@ impl Attention {
         let v = v.reshape((b, seq, self.heads, self.dim_head))?.transpose(1, 2)?.contiguous()?; // Metal matmul needs contiguous operands
 
         let q = apply_rope(&q, pe)?;
-        eprintln!("  [Attention] after rope q.shape={:?}", q.shape());
         let k = apply_rope(&k, pe)?;
-        eprintln!("  [Attention] after rope k.shape={:?}", k.shape());
         let (k_all, v_all) = match prefix {
             Some((pk, pv)) => (Tensor::cat(&[&crate::transformer::from_cache_entry(pk, &k)?, &k], 2)?, Tensor::cat(&[&crate::transformer::from_cache_entry(pv, &v)?, &v], 2)?),
             None => (k.clone(), v.clone()),
@@ -264,8 +262,6 @@ impl TransformerBlock {
         let gate1 = parts[1].clone();
         let scale2 = parts[2].clone();
         let gate2 = parts[3].clone();
-        eprintln!("  [Block] modulation.shape={:?}", modulation.shape());
-        eprintln!("  [Block] scale1.shape={:?}, gate1.shape={:?}, scale2.shape={:?}, gate2.shape={:?}", scale1.shape(), gate1.shape(), scale2.shape(), gate2.shape());
 
         // Attention: scale1 * norm1(x), gate1.tanh() * attn
         let normed = self.norm1.forward(x)?;

@@ -227,8 +227,10 @@ pub(crate) fn in_token_chunks(x: &Tensor, f: impl Fn(&Tensor) -> Result<Tensor>)
 static FLASH_ATTENTION: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 
 /// Route unmasked attention (every step after the first with the prefix KV
-/// cache) through FlashAttention v2. Masked attention always takes the chunked
-/// path: FA2 has no arbitrary-mask entry point.
+/// cache) through a fused kernel: FlashAttention v2 on CUDA (opt-in via
+/// `--flash-attn`), or candle's SDPA kernel on Metal (always on). Masked
+/// attention always takes the chunked path: neither kernel has an
+/// arbitrary-mask entry point.
 pub fn set_flash_attention(enabled: bool) -> Result<()> {
     if enabled && !cfg!(feature = "flash-attn") {
         candle_core::bail!("flash attention needs a build with `--features flash-attn`");
@@ -255,9 +257,17 @@ fn flash_attention(q: &Tensor, k: &Tensor, v: &Tensor, scale: f64) -> Result<Ten
 /// `[B, H, Skv, D]`. `mask` is a bool/u8 `[B, 1, Sq, Skv]` (or `[B, 1, 1, Skv]`)
 /// tensor, true where attending is allowed.
 pub(crate) fn chunked_attention(q: &Tensor, k: &Tensor, v: &Tensor, scale: f64, mask: Option<&Tensor>) -> Result<Tensor> {
+    // FlashAttention v2 (CUDA) for unmasked attention — every step after the
+    // first with the prefix KV cache.
     #[cfg(feature = "flash-attn")]
     if mask.is_none() && FLASH_ATTENTION.load(std::sync::atomic::Ordering::Relaxed) && q.device().is_cuda() {
         return flash_attention(q, k, v, scale);
+    }
+    // Metal fused SDPA for unmasked attention. The manual chunked path (matmul
+    // + softmax_last_dim + matmul with per-chunk contiguous copies) is ~26×
+    // slower than candle's fused Metal kernel on an M-series GPU.
+    if mask.is_none() && q.device().is_metal() {
+        return Ok(candle_nn::ops::sdpa(q, k, v, None, false, scale as f32, 1.0)?);
     }
     let (b, heads, sq, _) = q.dims4()?;
     let rows = (ATTENTION_SCORE_BUDGET_BYTES / (b * heads * k.dim(2)? * 4)).clamp(1, sq);

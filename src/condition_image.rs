@@ -54,6 +54,19 @@ pub fn load(path: &str, resolution: usize, device: &Device) -> Result<ConditionI
     from_rgba(&img, device)
 }
 
+/// Load a condition image from raw bytes (e.g. an HTTP upload), same pipeline
+/// as `load` but without touching disk.
+pub fn load_from_bytes(bytes: &[u8], resolution: usize, device: &Device) -> Result<ConditionImage> {
+    let img = image::load_from_memory(bytes)?.to_rgba8();
+    let (w, h) = calculate_dimensions((resolution * resolution) as f64, img.width() as f64 / img.height() as f64);
+    let img = if (img.width() as usize, img.height() as usize) == (w, h) {
+        img
+    } else {
+        image::imageops::resize(&img, w as u32, h as u32, FilterType::Lanczos3)
+    };
+    from_rgba(&img, device)
+}
+
 pub fn from_rgba(img: &RgbaImage, device: &Device) -> Result<ConditionImage> {
     let (w, h) = (img.width() as usize, img.height() as usize);
     anyhow::ensure!(w % (PATCH * MERGE) == 0 && h % (PATCH * MERGE) == 0, "condition image {w}x{h} is not a multiple of 32");
