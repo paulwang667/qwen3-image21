@@ -113,6 +113,43 @@ fn load_conv(native: bool, in_c: usize, out_c: usize, k: usize, padding: usize, 
     }
 }
 
+/// Upper bound on one convolution's im2col buffer. candle's conv2d (without
+/// cuDNN) materialises `C_in·k·k·H·W` values: at 1024² the decoder's last
+/// 288→144 3x3 conv alone would take ~10.9 GB in F32, which made the VAE decode
+/// the memory peak of the whole pipeline.
+const CONV_IM2COL_BUDGET_BYTES: usize = 1 << 30;
+
+/// `x.apply(conv)`, computed in horizontal bands when its im2col buffer would
+/// exceed the budget. Exact: the input is zero-padded once and each band reads
+/// `k - 1` halo rows. Only stride-1, undilated, ungrouped convs are banded.
+fn conv2d_banded(x: &Tensor, conv: &candle_nn::Conv2d) -> Result<Tensor> {
+    conv2d_banded_with_budget(x, conv, CONV_IM2COL_BUDGET_BYTES)
+}
+
+fn conv2d_banded_with_budget(x: &Tensor, conv: &candle_nn::Conv2d, budget_bytes: usize) -> Result<Tensor> {
+    let cfg = conv.config();
+    let (_, c_in, h, w) = x.dims4()?;
+    let k = conv.weight().dim(2)?;
+    let p = cfg.padding;
+    let (h_out, w_out) = (h + 2 * p + 1 - k, w + 2 * p + 1 - k);
+    let row_bytes = c_in * k * k * w_out * x.dtype().size_in_bytes();
+    if k == 1 || cfg.stride != 1 || cfg.dilation != 1 || cfg.groups != 1 || row_bytes * h_out <= budget_bytes {
+        return x.apply(conv);
+    }
+    let padded = x.pad_with_zeros(2, p, p)?.pad_with_zeros(3, p, p)?;
+    let band = (budget_bytes / row_bytes).max(1);
+    let mut outs = Vec::with_capacity(h_out.div_ceil(band));
+    for r0 in (0..h_out).step_by(band) {
+        let rows = band.min(h_out - r0);
+        let y = padded.narrow(2, r0, rows + k - 1)?.contiguous()?.conv2d(conv.weight(), 0, 1, 1, 1)?;
+        outs.push(match conv.bias() {
+            Some(b) => y.broadcast_add(&b.reshape((1, (), 1, 1))?)?,
+            None => y,
+        });
+    }
+    Tensor::cat(&outs, 2)
+}
+
 /// Residual block: norm1 -> silu -> conv1 -> norm2 -> silu -> conv2, plus a
 /// 1x1 shortcut conv when channel count changes. Matches `QwenImage21ResidualBlock`.
 /// The native checkpoint stores this as an indexed `nn.Sequential` (`residual.0`
@@ -153,10 +190,10 @@ impl ResidualBlock {
         };
         let mut y = self.norm1.forward(x)?;
         y = y.silu()?;
-        y = y.apply(&self.conv1)?;
+        y = conv2d_banded(&y, &self.conv1)?;
         y = self.norm2.forward(&y)?;
         y = y.silu()?;
-        y = y.apply(&self.conv2)?;
+        y = conv2d_banded(&y, &self.conv2)?;
         y + h
     }
 }
@@ -309,7 +346,7 @@ impl UpBlock {
             let h = x.dim(D::Minus2)? * 2;
             let w = x.dim(D::Minus1)? * 2;
             x = x.upsample_nearest2d(h, w)?;
-            x = x.apply(conv)?;
+            x = conv2d_banded(&x, conv)?;
         }
         if let Some(factor_t) = self.avg_shortcut_factor_t {
             let shortcut = dup_up3d(&x_copy, self.out_dim, factor_t, 2)?;
@@ -391,14 +428,14 @@ impl VaeDecoder {
     /// Decode latents `[B, z_dim, H, W]` to pixels `[B, out_channels, H*16, W*16]`.
     pub fn decode(&self, latents: &Tensor) -> Result<Tensor> {
         let mut x = latents.apply(&self.post_quant_conv)?;
-        x = x.apply(&self.conv_in)?;
+        x = conv2d_banded(&x, &self.conv_in)?;
         x = self.mid_block.forward(&x)?;
         for up_block in &self.up_blocks {
             x = up_block.forward(&x)?;
         }
         x = self.norm_out.forward(&x)?;
         x = x.silu()?;
-        x = x.apply(&self.conv_out)?;
+        x = conv2d_banded(&x, &self.conv_out)?;
         x.clamp(-1.0f64, 1.0f64)
     }
 }
@@ -520,12 +557,12 @@ impl VaeEncoder {
     /// `[B, z_dim, H/16, W/16]`: the posterior mean (upstream's
     /// `sample_mode="argmax"`), then `(x - latents_mean) / latents_std`.
     pub fn encode(&self, image: &Tensor) -> Result<Tensor> {
-        let mut x = image.apply(&self.conv_in)?;
+        let mut x = conv2d_banded(image, &self.conv_in)?;
         for block in &self.down_blocks {
             x = block.forward(&x)?;
         }
         x = self.mid_block.forward(&x)?;
-        x = self.norm_out.forward(&x)?.silu()?.apply(&self.conv_out)?.apply(&self.quant_conv)?;
+        x = conv2d_banded(&self.norm_out.forward(&x)?.silu()?, &self.conv_out)?.apply(&self.quant_conv)?;
         let mean = x.narrow(1, 0, self.z_dim)?;
         let (device, dt) = (mean.device(), mean.dtype());
         let m = Tensor::new(self.latents_mean.as_slice(), device)?.to_dtype(dt)?.reshape((1, self.z_dim, 1, 1))?;
@@ -585,6 +622,23 @@ mod tests {
     /// the same dim_mult/z_dim ratios; this exercises tensor-name wiring and the
     /// channel/spatial arithmetic through every up_block (equal-channel, channel-
     /// reducing, and the final no-upsample block) without needing a real checkpoint.
+    /// Banded convolution must equal the direct one (same weights and padding),
+    /// including a final band shorter than the others.
+    #[test]
+    fn test_conv2d_banded_matches_direct() {
+        let device = Device::Cpu;
+        let weight = Tensor::randn(0f32, 1f32, (5, 3, 3, 3), &device).unwrap();
+        let bias = Tensor::randn(0f32, 1f32, 5, &device).unwrap();
+        let conv = candle_nn::Conv2d::new(weight, Some(bias), Conv2dConfig { padding: 1, ..Default::default() });
+        let x = Tensor::randn(0f32, 1f32, (1, 3, 23, 17), &device).unwrap();
+        // 3·3·3·17·4 = 1836 bytes per output row; a 7-row budget gives bands of 7,7,7,2.
+        let banded = conv2d_banded_with_budget(&x, &conv, 1836 * 7).unwrap();
+        let direct = x.apply(&conv).unwrap();
+        assert_eq!(banded.dims(), direct.dims());
+        let diff = (direct - banded).unwrap().abs().unwrap().max_all().unwrap().to_scalar::<f32>().unwrap();
+        assert!(diff < 1e-5, "max diff {diff}");
+    }
+
     #[test]
     fn test_decoder_shapes() {
         let device = Device::Cpu;

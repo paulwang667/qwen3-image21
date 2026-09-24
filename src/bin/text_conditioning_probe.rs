@@ -44,11 +44,11 @@ fn main() -> Result<()> {
 
     // ── Text encoding ───────────────────────────────────────────────
     println!("Encoding prompt A: {prompt_a:?}");
-    let mut encoder_a = qwen3_image21::text_encoder::TextEncoder::load(&text_encoder_path, 4096, device.clone())?;
+    let mut encoder_a = qwen3_image21::text_encoder::TextEncoder::load(&text_encoder_path, 4096, device.clone(), candle_core::DType::F32)?;
     let emb_a = encoder_a.encode(&prompt_a)?;
     drop(encoder_a);
     println!("Encoding prompt B: {prompt_b:?}");
-    let mut encoder_b = qwen3_image21::text_encoder::TextEncoder::load(&text_encoder_path, 4096, device.clone())?;
+    let mut encoder_b = qwen3_image21::text_encoder::TextEncoder::load(&text_encoder_path, 4096, device.clone(), candle_core::DType::F32)?;
     let emb_b = encoder_b.encode(&prompt_b)?;
     drop(encoder_b);
     println!("emb_a.shape={:?} emb_b.shape={:?}", emb_a.shape(), emb_b.shape());

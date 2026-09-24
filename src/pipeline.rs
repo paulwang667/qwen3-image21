@@ -130,7 +130,10 @@ pub fn denoise(
         .map(|_| rand_distr::Distribution::<f32>::sample(&rand_distr::StandardNormal, &mut rng))
         .collect();
     let latents = Tensor::from_vec(noise, shape, &cfg.device)?;
-    let mut packed_latents = pack_latents(&latents)?.to_dtype(cfg.dtype)?;
+    // Latents stay F32 across steps (Euler updates accumulate); only the
+    // transformer's input and output are in `cfg.dtype`, as upstream's
+    // scheduler upcasts its step.
+    let mut packed_latents = pack_latents(&latents)?;
     let prompt_emb = prompt_emb.to_dtype(cfg.dtype)?;
     // Optional true CFG: `(negative_prompt_emb, true_cfg_scale)`.
     let guidance = match guidance {
@@ -158,7 +161,8 @@ pub fn denoise(
             _ => None,
         };
         let cache = if use_kv_cache { Some(cache) } else { None };
-        transformer.forward_conditioned(latents, timestep, text, height, width, condition.as_ref(), cache)
+        let pred = transformer.forward_conditioned(&latents.to_dtype(cfg.dtype)?, timestep, text, height, width, condition.as_ref(), cache)?;
+        pred.to_dtype(DType::F32)
     };
 
     // Denoising loop
@@ -167,12 +171,10 @@ pub fn denoise(
         // [B] (batch=1); `timestep_embedding` does its own unsqueeze to broadcast
         // against the exponent table, so this must stay 1-D here. f32, not f64:
         // Metal has no F64->F32 dtype-cast kernel.
-        let timestep = Tensor::new(&[t], &cfg.device)?
-            .to_dtype(packed_latents.dtype())?;
+        let timestep = Tensor::new(&[t], &cfg.device)?;
 
         // Apply timestep embedding (sinusoidal -> 256 dim)
-        let timestep = crate::scheduler::timestep_embedding(&timestep, 256)?
-            .to_dtype(packed_latents.dtype())?;
+        let timestep = crate::scheduler::timestep_embedding(&timestep, 256)?.to_dtype(cfg.dtype)?;
 
         let noise_pred = predict(&prompt_emb, prompt.image_slots.as_deref(), &timestep, &packed_latents, &mut cache)?;
         // Upstream QwenImage21Pipeline: neg + scale * (cond - neg), no rescaling.

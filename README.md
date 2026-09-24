@@ -9,7 +9,7 @@ Each stage (preprocessing, vision tower, text encoder, VAE, transformer, and the
 - **Single-stream MMDiT transformer**: 32 blocks, 32 heads × 128, with the checkpoint's `causal_condition` (text tokens use a t=0 modulation row, image tokens the real timestep's row).
 - **Official Qwen3-VL text encoder**: language model plus vision tower (for condition images, with multimodal RoPE and DeepStack); prompt wrapped in the upstream template, last decoder state taken before the final norm, system-prefix tokens dropped.
 - **Two transformer backends**:
-  - official diffusers safetensors (sharded, F32 compute)
+  - official diffusers safetensors (sharded, F32 or BF16 compute)
   - GGUF quantized weights, including ComfyUI-style GGUFs such as [`unsloth/Qwen-Image-2.1-GGUF`](https://huggingface.co/unsloth/Qwen-Image-2.1-GGUF) (Q8_0 and Q4_K_M tested)
 - **Prefix KV cache**: the per-layer K/V of the text and condition-image tokens are computed once and reused across denoising steps (on by default, as upstream).
 - **FlowMatch Euler scheduler** with the checkpoint's resolution-dependent exponential shift and `shift_terminal`.
@@ -105,7 +105,7 @@ Two 1024×1024 references combined into a 768×1024 poster with Chinese calligra
   --output poster.png
 ```
 
-The teacup keeps reference 1's blue floral pattern, gold rim, and saucer; the apple matches reference 2; both lines of Chinese text render without errors. Each 1024² reference adds 1,024 image tokens to the prompt (2,165 prompt tokens here) and 4,096 latent tokens to the transformer, so this run's sequence is 117 text + 8,192 reference + 3,072 target ≈ 11,400 tokens, and its prefix KV cache is ~8.7 GB in F32. A GGUF transformer was used because full precision already peaks at ~44 GB with one reference, and the second adds ~4.4 GB of cache, which likely exceeds a 46 GB GPU. That is an estimate, not a measurement.
+The teacup keeps reference 1's blue floral pattern, gold rim, and saucer; the apple matches reference 2; both lines of Chinese text render without errors. Each 1024² reference adds 1,024 image tokens to the prompt (2,165 prompt tokens here) and 4,096 latent tokens to the transformer, so this run's sequence is 117 text + 8,192 reference + 3,072 target ≈ 11,400 tokens, and its prefix KV cache is ~8.7 GB in F32. A GGUF transformer was used because full-precision F32 already peaks at ~41 GiB with one reference, and the second adds ~4.4 GB of cache, which likely exceeds a 46 GB GPU (an estimate, not a measurement; `--precision bf16` would halve the weights).
 
 ### Options
 
@@ -123,7 +123,8 @@ The teacup keeps reference 1's blue floral pattern, gold rim, and saucer; the ap
 | `--negative-prompt` | | Only used when `--true-cfg-scale > 1`. |
 | `--true-cfg-scale` | `1.0` (off) | `neg + scale × (cond − neg)`, no rescaling, as upstream. |
 | `--no-kv-cache` | off | Recompute the text prefix every step (for A/B checks). |
-| `--precision` | `f32` | Only `f32` has been verified end to end. |
+| `--precision` | `f32` | `bf16` halves the memory of the full-precision transformer and of the GPU text encoder (see [Memory](#memory)). GGUF transformers and the VAE always compute in F32. `f16` is untested. |
+| `--text-encoder-cpu` | off | Run the text encoder and vision tower on the CPU in F32: frees their GPU memory but adds ~75 s of prompt encoding. |
 | `--benchmark`, `--benchmark-iterations` | off, `3` | Keeps transformer + VAE loaded and times repeated runs. |
 | `--seed` | random | Printed at startup; pass it again to reproduce a run. Noise is drawn on the host, so a seed gives the same noise on every device. |
 | `--quantized` | | **Currently ignored**; the backend is chosen by the `--model-path` extension. |
@@ -142,9 +143,26 @@ NVIDIA L20 (46 GB), 1024×1024, 20 steps, denoising time only:
 - The KV-cache gain comes mostly from dropping the per-layer block-causal attention mask on cached steps, not from skipping the ~15 text tokens.
 - Accuracy vs. full precision (one forward pass, cosine similarity): Q8_0 0.99986, Q4_K_M 0.99537. Neither shows a visible quality difference.
 
-Image-conditioned generation at 1024×1024 (one 1024² condition image, 20 steps) roughly doubles the sequence to ~8,200 tokens: full precision 135 s (peak ~44 GB on the 46 GB L20), Q4_K_M 102 s. With two 1024² references and a 768×1024 output (~11,400 tokens), Q4_K_M takes 108 s. Attention is computed in chunks of 1,024 query rows so the score matrix never has to fit at once.
+Image-conditioned generation at 1024×1024 (one 1024² condition image, 20 steps) roughly doubles the sequence to ~8,200 tokens: full precision 135 s, Q4_K_M 102 s. With two 1024² references and a 768×1024 output (~11,400 tokens), Q4_K_M takes 108 s. Attention is computed in chunks of 1,024 query rows so the score matrix never has to fit at once.
 
-Models are loaded in phases (text encoder → VAE encoder for condition images → transformer → VAE decoder), each dropped before the next. Everything is loaded as F32. For text-to-image, peak memory is the text-encoder phase (about 34 GB of F32 weights, estimated from the 17 GB BF16 checkpoint); image-conditioned generation in full precision peaks in the transformer phase (~44 GB measured at 1024²), so use a GGUF transformer on smaller GPUs.
+### Memory
+
+Models are loaded in phases (text encoder → VAE encoder for condition images → transformer → VAE decoder), each dropped before the next, and the device is synchronized after each phase so CUDA's stream-ordered allocator actually returns the freed memory. The VAE's 3×3 convolutions run in row bands, because candle's im2col conv would otherwise allocate ~11 GB for one layer of a 1024² decode.
+
+Peak GPU memory (sampled with `nvidia-smi` every 100 ms), 1024² image-conditioned edit with one 1024² condition image, 20 steps, L20:
+
+| Transformer | Text encoder | Peak (GiB) | Text encoding | Denoising | Wall |
+|---|---|---|---|---|---|
+| Full, F32 (default) | GPU, F32 | 41.3 | 6 s | 136 s | 151 s |
+| Full, `--precision bf16` | GPU, BF16 | 24.0 | 5 s | 106 s | 119 s |
+| Full, `--precision bf16` | `--text-encoder-cpu` | 23.9 | 81 s | 106 s | 194 s |
+| Q4_K_M | GPU, F32 (default) | 35.0 | 6 s | 102 s | 115 s |
+| Q4_K_M, `--precision bf16` | GPU, BF16 | 18.8 | 5 s | 101 s | — |
+| Q4_K_M | `--text-encoder-cpu` | 16.9 | 79 s | 101 s | 187 s |
+
+- With a GGUF transformer, `--precision bf16` only changes the text encoder. **Q4_K_M + `--precision bf16`** is the practical low-memory setting: under 19 GiB at full speed.
+- The peak is whichever phase is largest: the text encoder (~34 GB F32 / ~17 GB BF16 of weights) or the transformer phase (weights, activations, and the prefix KV cache, which grows with the number of condition images).
+- BF16 accuracy vs. the F32 golden tensors (cosine): transformer 0.99996, text encoder 0.995, vision tower 0.996. The latents stay F32 across denoising steps and attention softmax runs in F32. In the runs above the output images differ from the F32 run by a mean 0.3 (BF16) and 1.3–1.4 (Q4_K_M) on a 0–255 scale, with no visible difference.
 
 ## Project layout
 
@@ -188,7 +206,7 @@ cargo test    # unit tests (RoPE vs. reference formula, dup_up3d, scheduler, att
 
 - `--quantized` is redundant (the backend is chosen by the `--model-path` extension).
 - Condition images are resized with the `image` crate's Lanczos3, close to but not bit-identical with upstream's PIL resize.
-- Only F32 compute has been verified; `--precision f16/bf16` is untested.
+- `--precision bf16` has been verified (see [Memory](#memory)); `f16` is untested.
 - End-to-end quality has been verified on CUDA only. The CPU path was checked at the single-forward level (quantized on CPU matches full precision); Metal has not been re-verified since the correctness fixes.
 - No flash attention: attention scores are materialised in full.
 

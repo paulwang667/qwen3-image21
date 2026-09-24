@@ -64,9 +64,17 @@ struct Args {
     #[arg(long)]
     quantized: bool,
 
-    /// Compute precision: f32, f16, or bf16
+    /// Weight/compute precision of the full-precision transformer and of the
+    /// text encoder on the GPU. GGUF transformers always compute in F32 and the
+    /// VAE always runs in F32.
     #[arg(long, value_enum, default_value_t = Precision::F32)]
     precision: Precision,
+
+    /// Run the text encoder (and vision tower) on the CPU in F32 instead of the
+    /// GPU: removes its ~34 GB F32 / ~17 GB BF16 from GPU memory at the cost of
+    /// slower prompt encoding.
+    #[arg(long)]
+    text_encoder_cpu: bool,
 
     /// Run benchmark mode (multiple iterations)
     #[arg(long)]
@@ -138,21 +146,25 @@ fn encode_prompt(
     negative_prompt: Option<&str>,
     images: &[qwen3_image21::condition_image::ConditionImage],
     device: &Device,
+    encoder_device: &Device,
+    encoder_dtype: DType,
 ) -> Result<(PromptEmbeds, Option<PromptEmbeds>)> {
     eprintln!("[Phase 1] Text encoding");
+    let start = std::time::Instant::now();
     let embs = match text_encoder_path {
         Some(path) => {
-            eprintln!("  Loading text encoder from: {}", path);
+            eprintln!("  Loading text encoder from: {} ({:?} on {:?})", path, encoder_dtype, encoder_device);
             // Dropped when this scope ends.
-            let mut encoder = qwen3_image21::text_encoder::TextEncoder::load(path, 4096, device.clone())?;
+            let mut encoder = qwen3_image21::text_encoder::TextEncoder::load(path, 4096, encoder_device.clone(), encoder_dtype)?;
             let mut encode = |p: &str| -> Result<PromptEmbeds> {
-                if images.is_empty() {
-                    Ok(PromptEmbeds { embeds: encoder.encode(p)?, image_slots: None })
+                let (embeds, image_slots) = if images.is_empty() {
+                    (encoder.encode(p)?, None)
                 } else {
                     // Upstream encodes the negative prompt with the same condition images.
                     let (embeds, slots) = encoder.encode_with_images(p, images)?;
-                    Ok(PromptEmbeds { embeds, image_slots: Some(slots) })
-                }
+                    (embeds, Some(slots))
+                };
+                Ok(PromptEmbeds { embeds: embeds.to_device(device)?, image_slots })
             };
             let negative = negative_prompt.map(&mut encode).transpose()?;
             (encode(prompt)?, negative)
@@ -169,7 +181,8 @@ fn encode_prompt(
             (random()?, negative_prompt.map(|_| random()).transpose()?)
         }
     };
-    eprintln!("  Text encoding done. Encoder released.");
+    release_freed_memory(device)?;
+    eprintln!("  Text encoding done in {:.2}s. Encoder released.", start.elapsed().as_secs_f32());
     Ok(embs)
 }
 
@@ -190,7 +203,19 @@ fn encode_condition_images(
         packed.push(qwen3_image21::vae::pack_latents(&latents.unsqueeze(2)?)?);
         shapes.push((h, w));
     }
-    Ok(ConditionLatents { latents: Tensor::cat(&packed, 1)?, shapes })
+    let latents = Tensor::cat(&packed, 1)?;
+    drop(encoder);
+    release_freed_memory(device)?;
+    Ok(ConditionLatents { latents, shapes })
+}
+
+/// candle's CUDA backend allocates from stream-ordered memory pools, which keep
+/// freed memory reserved until the next device synchronize. Without this, a
+/// dropped model's memory stays reserved, and the next model's large buffers
+/// don't fit into its fragmented blocks, so the phases' peaks add up (measured:
+/// the transformer's 17 GB stayed reserved under the VAE decode's 10 GB).
+fn release_freed_memory(device: &Device) -> Result<()> {
+    Ok(device.synchronize()?)
 }
 
 /// Save image tensor [-1,1] to PNG file. The VAE decoder outputs 4 channels
@@ -259,11 +284,14 @@ fn main() -> Result<()> {
     let model_path = args.model_path.as_ref().unwrap();
     let vae_path = args.vae_path.as_ref().map(|s| s.as_str()).unwrap_or(model_path.as_str());
 
+    // candle's quantized matmul takes F32 input, so GGUF transformers compute in F32.
+    let transformer_dtype = if model_path.ends_with(".gguf") { DType::F32 } else { dtype };
     let pipeline_cfg = PipelineConfig {
         vae_cfg: VaeConfig::default(),
         device: device.clone(),
-        dtype,
+        dtype: transformer_dtype,
     };
+    let (encoder_device, encoder_dtype) = if args.text_encoder_cpu { (Device::Cpu, DType::F32) } else { (device.clone(), dtype) };
 
     // ── Phase 1: Text encoding (load → encode → drop) ──────────────
     // Upstream enables true CFG only with scale > 1 AND a negative prompt.
@@ -279,6 +307,8 @@ fn main() -> Result<()> {
         args.negative_prompt.as_deref().filter(|_| do_cfg),
         &condition_images,
         &device,
+        &encoder_device,
+        encoder_dtype,
     )?;
     let guidance = negative_emb.as_ref().map(|neg| (neg, args.true_cfg_scale));
     let condition = if condition_images.is_empty() {
@@ -292,10 +322,10 @@ fn main() -> Result<()> {
     let image = if args.benchmark {
         // Benchmark: transformer + VAE loaded together for repeated runs.
         eprintln!("[Phase 2] Loading transformer...");
-        let transformer = load_transformer(model_path, &device, args.quantized, dtype)?;
+        let transformer = load_transformer(model_path, &device, args.quantized, transformer_dtype)?;
 
         eprintln!("[Phase 2/3] Loading VAE...");
-        let vae_decoder = load_vae(vae_path, &device, dtype)?;
+        let vae_decoder = load_vae(vae_path, &device, DType::F32)?;
 
         // Warmup
         eprintln!("Warming up...");
@@ -334,7 +364,7 @@ fn main() -> Result<()> {
     } else {
         // Normal mode: load transformer → denoise → drop → load VAE → decode → drop
         eprintln!("[Phase 2] Loading transformer...");
-        let transformer = load_transformer(model_path, &device, args.quantized, dtype)?;
+        let transformer = load_transformer(model_path, &device, args.quantized, transformer_dtype)?;
 
         eprintln!("  Denoising ({} steps)...", args.steps);
         let start = std::time::Instant::now();
@@ -352,10 +382,11 @@ fn main() -> Result<()> {
 
         // Drop transformer before loading VAE — frees ~3.8-6.8 GB.
         drop(transformer);
+        release_freed_memory(&device)?;
         eprintln!("  Transformer released.");
 
         eprintln!("[Phase 3] Loading VAE...");
-        let vae_decoder = load_vae(vae_path, &device, dtype)?;
+        let vae_decoder = load_vae(vae_path, &device, DType::F32)?;
 
         eprintln!("  Decoding...");
         let decode_start = std::time::Instant::now();

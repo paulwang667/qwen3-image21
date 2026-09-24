@@ -63,8 +63,10 @@ fn find_tokenizer(dir: &Path) -> Result<PathBuf> {
 }
 
 impl TextEncoder {
-    /// Loads from `model_dir`, auto-detecting the official vs. stand-in layout.
-    pub fn load(model_dir: impl AsRef<Path>, joint_attention_dim: usize, device: Device) -> Result<Self> {
+    /// Loads from `model_dir`, auto-detecting the official vs. stand-in layout,
+    /// with weights in `dtype` on `device` (e.g. F32 on the CPU to keep the
+    /// ~34 GB F32 encoder off the GPU, or BF16 on the GPU to halve it).
+    pub fn load(model_dir: impl AsRef<Path>, joint_attention_dim: usize, device: Device, dtype: DType) -> Result<Self> {
         let dir = model_dir.as_ref();
         let config_json: serde_json::Value = serde_json::from_str(&std::fs::read_to_string(dir.join("config.json"))?)?;
         let tokenizer_path = find_tokenizer(dir)?;
@@ -92,7 +94,7 @@ impl TextEncoder {
                 .ok_or_else(|| anyhow!("no .safetensors file found in {}", dir.display()))?;
             let paths = resolve_safetensors_paths(&first_shard.to_string_lossy())?;
             eprintln!("  Loading official text encoder from {} safetensors shard(s)...", paths.len());
-            let vb = unsafe { VarBuilder::from_mmaped_safetensors(&paths, DType::F32, &device)? };
+            let vb = unsafe { VarBuilder::from_mmaped_safetensors(&paths, dtype, &device)? };
             Backend::Official(Official {
                 text: crate::qwen3_vl_text::Qwen3VLTextEncoder::new(&cfg.text_config, vb.clone())?,
                 vision: crate::qwen3_vl_vision::Qwen3VLVisionModel::new(&vision_cfg, vb.pp("model").pp("visual"))?,
@@ -110,7 +112,7 @@ impl TextEncoder {
             }
             let tile_factor = joint_attention_dim / config.hidden_size;
             let vb = unsafe {
-                VarBuilder::from_mmaped_safetensors(&[dir.join("model.safetensors")], DType::F32, &device)?
+                VarBuilder::from_mmaped_safetensors(&[dir.join("model.safetensors")], dtype, &device)?
             };
             let model = candle_transformers::models::qwen3::Model::new(&config, vb)?;
             Backend::StandIn { model, tile_factor }
@@ -179,8 +181,9 @@ impl TextEncoder {
         let features = if images.is_empty() {
             None
         } else {
-            let pixel_values = Tensor::cat(&images.iter().map(|i| &i.pixel_values).collect::<Vec<_>>(), 0)?;
-            let grid = Tensor::cat(&images.iter().map(|i| &i.grid_thw).collect::<Vec<_>>(), 0)?;
+            // The images may have been prepared on another device than the encoder's.
+            let pixel_values = Tensor::cat(&images.iter().map(|i| &i.pixel_values).collect::<Vec<_>>(), 0)?.to_device(&self.device)?;
+            let grid = Tensor::cat(&images.iter().map(|i| &i.grid_thw).collect::<Vec<_>>(), 0)?.to_device(&self.device)?;
             let (embeds, deepstack) = enc.vision.forward(&pixel_values, &grid)?;
             let m = enc.spatial_merge_size;
             let merged_grids = grid.to_vec2::<u32>()?.iter().map(|g| (g[0] as usize, g[1] as usize / m, g[2] as usize / m)).collect();

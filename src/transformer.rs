@@ -198,7 +198,8 @@ pub(crate) fn chunked_attention(q: &Tensor, k: &Tensor, v: &Tensor, scale: f64, 
             let zero = Tensor::new(0f32, w.device())?.to_dtype(w.dtype())?.broadcast_as(m.dims())?;
             w = w.broadcast_add(&m.where_cond(&zero, &neg_inf)?)?;
         }
-        let w = candle_nn::ops::softmax(&w, D::Minus1)?;
+        // Softmax in F32 even for BF16/F16 weights; exp/sum lose too much otherwise.
+        let w = candle_nn::ops::softmax(&w.to_dtype(DType::F32)?, D::Minus1)?.to_dtype(v.dtype())?;
         outs.push(w.matmul(v)?);
     }
     Tensor::cat(&outs, 2)
@@ -268,8 +269,10 @@ impl Modulation {
 
 /// Create a fixed LayerNorm (ones weight, no bias, no learnable params).
 /// Qwen-Image-2.1 uses elementwise_affine=False LayerNorm in blocks and final layer.
-fn fixed_layer_norm(dim: usize, device: &Device) -> Result<LayerNorm> {
-    let ws = Tensor::ones(dim, DType::F32, device)?;
+fn fixed_layer_norm(dim: usize, device: &Device, dtype: DType) -> Result<LayerNorm> {
+    // candle multiplies the normalized activations by this weight in their own
+    // dtype, so it must match the model dtype (BF16 runs would fail otherwise).
+    let ws = Tensor::ones(dim, dtype, device)?;
     Ok(LayerNorm::new_no_bias(ws, 1e-6))
 }
 
@@ -288,9 +291,9 @@ impl TransformerBlock {
         let hidden = cfg.hidden_size();
         let device = vb.device();
 
-        let norm1 = fixed_layer_norm(hidden, device)?;
+        let norm1 = fixed_layer_norm(hidden, device, vb.dtype())?;
         let attn = Attention::new(cfg, vb.pp("attn"))?;
-        let norm2 = fixed_layer_norm(hidden, device)?;
+        let norm2 = fixed_layer_norm(hidden, device, vb.dtype())?;
         let mlp = GatedMlp::new(cfg, vb.pp("img_mlp"))?;
 
         Ok(Self { norm1, attn, norm2, mlp })
@@ -344,7 +347,7 @@ impl FinalLayer {
     fn new(cfg: &Config, vb: candle_nn::VarBuilder) -> Result<Self> {
         let hidden = cfg.hidden_size();
         let device = vb.device();
-        let norm = fixed_layer_norm(hidden, device)?;
+        let norm = fixed_layer_norm(hidden, device, vb.dtype())?;
         let linear = candle_nn::linear_b(hidden, hidden, false, vb.pp("linear"))?;
         Ok(Self { norm, linear })
     }
@@ -388,8 +391,7 @@ impl TextEmbedder {
         // ZeroCenterRMSNorm: checkpoint stores (scale - 1), effective scale = weight + 1.
         // We add 1 to the loaded weight so RmsNorm uses the true scale.
         let raw_weight = vb.get(hidden, "text_norm.weight")?;
-        let ones = Tensor::ones(raw_weight.shape(), DType::F32, vb.device())?;
-        let text_norm_weight = raw_weight.broadcast_add(&ones)?;
+        let text_norm_weight = (raw_weight + 1.0)?;
         let text_norm = RmsNorm::new(text_norm_weight, 1e-6);
 
         let in_layer = candle_nn::linear_b(cfg.joint_attention_dim, hidden, false, vb.pp("in_layer"))?;
@@ -552,6 +554,7 @@ impl QwenImageTransformer {
         let pe = EmbedNd::new(self.cfg.hidden_size(), self.cfg.rope_theta, self.cfg.axes_dims_rope, &self.device)?
             .forward(&layout.img_shapes, &image_pad_mask, &self.device)?;
         let pe = if cached.is_some() { pe.narrow(0, prefix_len, seq_img)?.contiguous()? } else { pe };
+        let pe = pe.to_dtype(x.dtype())?;
 
         // Keys cover the whole joint sequence in both modes; only prompt
         // (text) positions can be padding.

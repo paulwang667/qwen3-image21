@@ -11,7 +11,7 @@ fn main() -> Result<()> {
         .nth(1)
         .unwrap_or_else(|| "/Users/sn-0523/Desktop/projects/qwen3-jev/models/qwen3-0.6b".to_string());
 
-    let mut encoder = TextEncoder::load(&model_dir, 4096, device)?;
+    let mut encoder = TextEncoder::load(&model_dir, 4096, device, candle_core::DType::F32)?;
 
     let a = encoder.encode("a red apple on a table")?;
     let b = encoder.encode("a blue spaceship in outer space")?;

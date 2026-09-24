@@ -225,7 +225,8 @@ impl Attention {
 
         let attn_weights = (q.matmul(&k.transpose(2, 3)?)? * self.softmax_scale)?;
         let attn_weights = attn_weights.broadcast_add(causal_mask)?;
-        let attn_weights = candle_nn::ops::softmax_last_dim(&attn_weights)?;
+        // Softmax in F32 even for BF16/F16 weights.
+        let attn_weights = candle_nn::ops::softmax_last_dim(&attn_weights.to_dtype(DType::F32)?)?.to_dtype(v.dtype())?;
         let attn_out = attn_weights.matmul(&v)?;
         let attn_out = attn_out.transpose(1, 2)?.reshape((b, seq, self.num_heads * self.head_dim))?;
         self.o_proj.forward(&attn_out)

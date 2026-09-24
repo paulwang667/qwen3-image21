@@ -45,7 +45,12 @@ fn text_encoder_vb(root: &str, dev: &Device) -> Result<VarBuilder<'static>> {
         .filter(|p| p.ends_with(".safetensors"))
         .collect();
     paths.sort();
-    Ok(unsafe { VarBuilder::from_mmaped_safetensors(&paths, DType::F32, dev)? })
+    let dt = match std::env::var("I2I_DTYPE").as_deref() {
+        Ok("bf16") => DType::BF16,
+        Ok("f16") => DType::F16,
+        _ => DType::F32,
+    };
+    Ok(unsafe { VarBuilder::from_mmaped_safetensors(&paths, dt, dev)? })
 }
 
 fn load_vision(root: &str, dev: &Device) -> Result<qwen3_image21::qwen3_vl_vision::Qwen3VLVisionModel> {
@@ -62,6 +67,13 @@ fn main() -> Result<()> {
     let ref_dir = args.get(2).cloned().unwrap_or_else(|| "/root/qi21_ref".into());
     let root = args.get(3).cloned().unwrap_or_else(|| "models/Qwen-Image-2.1-official".into());
     let dev = device()?;
+    // I2I_DTYPE=bf16 loads the vision, text, and transformer stages in BF16 to
+    // measure that precision against the (F32) golden tensors.
+    let dt = match std::env::var("I2I_DTYPE").as_deref() {
+        Ok("bf16") => DType::BF16,
+        Ok("f16") => DType::F16,
+        _ => DType::F32,
+    };
 
     match stage {
         "vae" => {
@@ -140,8 +152,9 @@ fn main() -> Result<()> {
             let paths = qwen3_image21::safetensors_util::resolve_safetensors_paths(&format!(
                 "{root}/transformer/diffusion_pytorch_model-00001-of-00002.safetensors"
             ))?;
-            let vb = unsafe { VarBuilder::from_mmaped_safetensors(&paths, DType::F32, &dev)? };
+            let vb = unsafe { VarBuilder::from_mmaped_safetensors(&paths, dt, &dev)? };
             let model = qwen3_image21::transformer::QwenImageTransformer::new(&qwen3_image21::transformer::Config::default(), vb)?;
+            let (prompt_embeds, cond, noise, t) = (prompt_embeds.to_dtype(dt)?, cond.to_dtype(dt)?, noise.to_dtype(dt)?, t.to_dtype(dt)?);
             let shapes = [(h, w)];
             let condition = qwen3_image21::joint_layout::ConditionTokens { latents: &cond, shapes: &shapes, text_image_mask: &slots };
             let (height, width) = (h * 16, w * 16); // target same size as the condition in the dump
@@ -162,7 +175,7 @@ fn main() -> Result<()> {
             let (h, w, _) = rgba.dims3()?;
             let img = image::RgbaImage::from_raw(w as u32, h as u32, rgba.flatten_all()?.to_vec1::<u8>()?).unwrap();
             let cond = qwen3_image21::condition_image::from_rgba(&img, &dev)?;
-            let mut encoder = qwen3_image21::text_encoder::TextEncoder::load(format!("{root}/text_encoder"), 4096, dev.clone())?;
+            let mut encoder = qwen3_image21::text_encoder::TextEncoder::load(format!("{root}/text_encoder"), 4096, dev.clone(), candle_core::DType::F32)?;
             let (embeds, slots) = encoder.encode_with_images("Change the apple to a green apple", std::slice::from_ref(&cond))?;
             let want_slots: Vec<bool> = load(&ref_dir, "text", "image_pad_mask", &Device::Cpu)?
                 .flatten_all()?.to_vec1::<f32>()?.iter().map(|&v| v > 0.5).collect();
