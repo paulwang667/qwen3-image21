@@ -19,7 +19,15 @@ Each stage (preprocessing, vision tower, text encoder, VAE, transformer, and the
 
 ## Getting the weights
 
-A quantized GGUF transformer plus the text encoder (17 GB), tokenizer, and VAE (1.4 GB) from the official repo [`Qwen/Qwen-Image-2.1`](https://huggingface.co/Qwen/Qwen-Image-2.1):
+With the [`hf` CLI](https://huggingface.co/docs/huggingface_hub/guides/cli) installed (`pip install -U huggingface_hub`):
+
+```bash
+scripts/download.sh          # Q4_K_M GGUF (fits a 12 GB GPU), ~23 GB in total
+scripts/download.sh q8       # Q8_0 GGUF, ~27 GB
+scripts/download.sh full     # official full-precision transformer, ~33 GB
+```
+
+It downloads into `models/` (a second argument picks another directory, used with `--model-dir`), resumes when re-run, and `DRY_RUN=1` lists the files without downloading. By hand, the same is a GGUF transformer plus the text encoder (17.5 GB), tokenizer, and VAE (1.4 GB) from the official repo [`Qwen/Qwen-Image-2.1`](https://huggingface.co/Qwen/Qwen-Image-2.1):
 
 ```bash
 hf download unsloth/Qwen-Image-2.1-GGUF qwen-image-2.1-Q4_K_M.gguf --local-dir models

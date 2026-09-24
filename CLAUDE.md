@@ -19,6 +19,8 @@ PATH=/usr/local/cuda/bin:$PATH CUDA_COMPUTE_CAP=89 cargo build --release --featu
 cargo test                     # run unit tests (gguf_mapping, attention_mask)
 cargo test test_identity_global   # run a single test by name
 
+scripts/download.sh [q4|q8|full] [dir]   # weights via the hf CLI into the layout --model-dir expects (DRY_RUN=1 lists files)
+
 # Run inference. Model paths default to --model-dir (models/): the only *.gguf there
 # (else the official repo's transformer/ shards) + the official repo's text_encoder/ and
 # vae/ (the dir itself or its one subdir with text_encoder/config.json) — see model_dir.rs.
