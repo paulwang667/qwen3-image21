@@ -60,6 +60,12 @@ struct Args {
     #[arg(long)]
     no_kv_cache: bool,
 
+    /// Keep the prefix KV cache in host memory, copying each layer's entries to
+    /// the GPU only while that layer runs: saves ~2.2 GB of GPU memory per
+    /// 1024² condition image, at the cost of PCIe transfers every step.
+    #[arg(long)]
+    kv_cache_cpu: bool,
+
     /// Use quantized model
     #[arg(long)]
     quantized: bool,
@@ -276,6 +282,7 @@ fn main() -> Result<()> {
     let dtype = args.precision.as_dtype();
     candle_core::cuda::set_gemm_reduced_precision_f32(args.tf32);
     qwen3_image21::transformer::set_flash_attention(args.flash_attn)?;
+    qwen3_image21::transformer::set_kv_cache_offload(args.kv_cache_cpu);
 
     eprintln!("Device: {:?}", device);
     eprintln!("Prompt: {}", args.prompt);

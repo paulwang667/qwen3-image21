@@ -23,6 +23,27 @@ pub struct TextKvCache {
 /// cast back to the compute dtype when attended to.
 pub(crate) const KV_CACHE_DTYPE: DType = DType::BF16;
 
+static KV_CACHE_OFFLOAD: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// Keep [`TextKvCache`] in host memory instead of on the device: each layer's
+/// entries are copied to the device only while that layer runs. Trades PCIe
+/// transfers every step for the cache's device memory (~2.2 GB per 1024²
+/// condition image).
+pub fn set_kv_cache_offload(enabled: bool) {
+    KV_CACHE_OFFLOAD.store(enabled, std::sync::atomic::Ordering::Relaxed);
+}
+
+/// Converts one layer's freshly computed K or V into its cached form.
+pub(crate) fn to_cache_entry(t: &Tensor) -> Result<Tensor> {
+    let t = t.to_dtype(KV_CACHE_DTYPE)?;
+    if KV_CACHE_OFFLOAD.load(std::sync::atomic::Ordering::Relaxed) { t.to_device(&Device::Cpu) } else { Ok(t) }
+}
+
+/// A cached K or V as an operand next to `like` (its device and dtype).
+pub(crate) fn from_cache_entry(t: &Tensor, like: &Tensor) -> Result<Tensor> {
+    t.to_device(like.device())?.to_dtype(like.dtype())
+}
+
 /// Qwen-Image-2.1 Transformer config (32 Single-Stream DiT layers).
 #[derive(Debug, Clone)]
 pub struct Config {
@@ -163,7 +184,7 @@ impl Attention {
         let q = apply_rope(&q, pe)?;
         let k = apply_rope(&k, pe)?;
         let (k_all, v_all) = match prefix {
-            Some((pk, pv)) => (Tensor::cat(&[&pk.to_dtype(k.dtype())?, &k], 2)?, Tensor::cat(&[&pv.to_dtype(v.dtype())?, &v], 2)?),
+            Some((pk, pv)) => (Tensor::cat(&[&from_cache_entry(pk, &k)?, &k], 2)?, Tensor::cat(&[&from_cache_entry(pv, &v)?, &v], 2)?),
             None => (k.clone(), v.clone()),
         };
         let attn_out = chunked_attention(&q, &k_all, &v_all, (self.dim_head as f64).powf(-0.5), attention_mask)?;
@@ -669,7 +690,7 @@ impl QwenImageTransformer {
         let mut layers = Vec::with_capacity(self.transformer_blocks.len());
         for block in &self.transformer_blocks {
             let (h, k, v) = block.forward(&hidden_states, &modulation, &pe, Some(&mask), None)?;
-            layers.push((k.to_dtype(KV_CACHE_DTYPE)?, v.to_dtype(KV_CACHE_DTYPE)?));
+            layers.push((to_cache_entry(&k)?, to_cache_entry(&v)?));
             hidden_states = h;
         }
         Ok(TextKvCache { layers })

@@ -122,7 +122,7 @@ impl Attention {
         let k = apply_rope(&k, pe)?;
         eprintln!("  [Attention] after rope k.shape={:?}", k.shape());
         let (k_all, v_all) = match prefix {
-            Some((pk, pv)) => (Tensor::cat(&[&pk.to_dtype(k.dtype())?, &k], 2)?, Tensor::cat(&[&pv.to_dtype(v.dtype())?, &v], 2)?),
+            Some((pk, pv)) => (Tensor::cat(&[&crate::transformer::from_cache_entry(pk, &k)?, &k], 2)?, Tensor::cat(&[&crate::transformer::from_cache_entry(pv, &v)?, &v], 2)?),
             None => (k.clone(), v.clone()),
         };
 
@@ -368,7 +368,7 @@ impl QwenImageTransformerQuantized {
         let mut layers = Vec::with_capacity(self.transformer_blocks.len());
         for block in &self.transformer_blocks {
             let (out, k, v) = block.forward(&h, &modulation, &pe, Some(&mask), None)?;
-            layers.push((k.to_dtype(crate::transformer::KV_CACHE_DTYPE)?, v.to_dtype(crate::transformer::KV_CACHE_DTYPE)?));
+            layers.push((crate::transformer::to_cache_entry(&k)?, crate::transformer::to_cache_entry(&v)?));
             h = out;
         }
         Ok(TextKvCache { layers })
