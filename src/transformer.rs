@@ -1,6 +1,7 @@
 use candle_core::{Module, Result, Tensor, D, DType, Device};
 use candle_nn::{LayerNorm, Linear, RmsNorm};
-use super::attention_mask::{build_block_causal_mask, build_token_metadata};
+use super::attention_mask::build_block_causal_mask;
+use super::joint_layout::{ConditionTokens, JointLayout};
 use super::rope::{apply_rope, EmbedNd};
 use super::scheduler::TimeEmbedding;
 
@@ -98,7 +99,6 @@ pub struct Attention {
     heads: usize,
     dim_head: usize,
     inner_dim: usize,
-    dropout: f64,
 }
 
 impl Attention {
@@ -127,7 +127,6 @@ impl Attention {
             heads: cfg.num_attention_heads,
             dim_head: d_head,
             inner_dim: h_sz,
-            dropout: 0.0,
         })
     }
 
@@ -164,30 +163,8 @@ impl Attention {
             Some((pk, pv)) => (Tensor::cat(&[pk, &k], 2)?, Tensor::cat(&[pv, &v], 2)?),
             None => (k.clone(), v.clone()),
         };
-        // Attention
-        let scale = (self.dim_head as f64).powf(-0.5);
-        let mut attn_weights = q.matmul(&k_all.transpose(2, 3)?)?.affine(scale, 0.0)?;
+        let attn_out = chunked_attention(&q, &k_all, &v_all, (self.dim_head as f64).powf(-0.5), attention_mask)?;
 
-        // Apply attention mask if provided
-        if let Some(mask) = attention_mask {
-            // mask: [batch, 1, seq_q, seq_kv] bool, True = attend
-            // Convert to additive mask: 0 for attend, -inf for masked
-            let neg_inf = Tensor::new(f32::NEG_INFINITY, attn_weights.device())?.broadcast_as(mask.dims())?.contiguous()?;
-            let zero = Tensor::new(0.0f32, attn_weights.device())?.broadcast_as(mask.dims())?.contiguous()?;
-            let additive_mask = mask.where_cond(&zero, &neg_inf)?; // [batch, 1, seq, seq]
-            attn_weights = attn_weights.broadcast_add(&additive_mask)?;
-        }
-        
-        let mut attn_weights = candle_nn::ops::softmax(&attn_weights, D::Minus1)?;
-        
-        // Apply dropout if enabled
-        if self.dropout > 0.0 {
-            let mask = attn_weights.rand_like(0.0, 1.0)?.gt(self.dropout as f32)?;
-            attn_weights = attn_weights.mul(&mask)?.affine(1.0 / (1.0 - self.dropout), 0.0)?;
-        }
-        
-        let attn_out = attn_weights.matmul(&v_all)?;
-        
         // Reshape back: [B, H, S, D] -> [B, S, D]
         let attn_out = attn_out.transpose(1, 2)?.reshape((b, seq, self.inner_dim))?;
         
@@ -195,6 +172,36 @@ impl Attention {
         Ok((attn_out.apply(&self.to_out)?, k, v))
     }
     
+}
+
+/// Query rows per attention chunk. Image-conditioned sequences reach ~8k
+/// tokens at 1024², where one full `[1, 32, S, S]` F32 score matrix is ~8.6 GB;
+/// chunking the queries keeps each materialised block near 1 GB. Every query
+/// row is computed exactly as without chunking.
+const ATTENTION_CHUNK_ROWS: usize = 1024;
+
+/// `softmax(q kᵀ · scale + mask) v` for `q` `[B, H, Sq, D]` and `k`/`v`
+/// `[B, H, Skv, D]`. `mask` is a bool/u8 `[B, 1, Sq, Skv]` (or `[B, 1, 1, Skv]`)
+/// tensor, true where attending is allowed.
+pub(crate) fn chunked_attention(q: &Tensor, k: &Tensor, v: &Tensor, scale: f64, mask: Option<&Tensor>) -> Result<Tensor> {
+    let sq = q.dim(2)?;
+    let kt = k.transpose(2, 3)?.contiguous()?;
+    let mut outs = Vec::with_capacity(sq.div_ceil(ATTENTION_CHUNK_ROWS));
+    for start in (0..sq).step_by(ATTENTION_CHUNK_ROWS) {
+        let len = ATTENTION_CHUNK_ROWS.min(sq - start);
+        let q_chunk = q.narrow(2, start, len)?.contiguous()?;
+        let mut w = q_chunk.matmul(&kt)?.affine(scale, 0.0)?;
+        if let Some(mask) = mask {
+            let m = if mask.dim(2)? == 1 { mask.clone() } else { mask.narrow(2, start, len)? };
+            // Additive mask: 0 where allowed, -inf where masked.
+            let neg_inf = Tensor::new(f32::NEG_INFINITY, w.device())?.to_dtype(w.dtype())?.broadcast_as(m.dims())?;
+            let zero = Tensor::new(0f32, w.device())?.to_dtype(w.dtype())?.broadcast_as(m.dims())?;
+            w = w.broadcast_add(&m.where_cond(&zero, &neg_inf)?)?;
+        }
+        let w = candle_nn::ops::softmax(&w, D::Minus1)?;
+        outs.push(w.matmul(v)?);
+    }
+    Tensor::cat(&outs, 2)
 }
 
 /// Gated MLP (SwiGLU) for Qwen-Image-2.1.
@@ -442,7 +449,7 @@ impl QwenImageTransformer {
         height: usize,
         width: usize,
     ) -> Result<Tensor> {
-        self.forward_impl(hidden_states, encoder_hidden_states, encoder_hidden_states_mask, timestep, height, width, None)
+        self.forward_conditioned(hidden_states, encoder_hidden_states, encoder_hidden_states_mask, timestep, height, width, None, None)
     }
 
     /// Denoising step reusing the text prefix's per-layer K/V (see
@@ -459,10 +466,16 @@ impl QwenImageTransformer {
         width: usize,
         cache: &mut Option<TextKvCache>,
     ) -> Result<Tensor> {
-        self.forward_impl(hidden_states, Some(encoder_hidden_states), encoder_hidden_states_mask, timestep, height, width, Some(cache))
+        self.forward_conditioned(hidden_states, Some(encoder_hidden_states), encoder_hidden_states_mask, timestep, height, width, None, Some(cache))
     }
 
-    fn forward_impl(
+    /// General denoising step: `hidden_states` are the target's packed noisy
+    /// latents; `condition` places condition images in the prompt's image
+    /// slots (see [`JointLayout`]); `cache` reuses the prefix K/V (text and
+    /// condition images) as in [`Self::forward_with_text_cache`]. Returns the
+    /// target tokens' prediction.
+    #[allow(clippy::too_many_arguments)]
+    pub fn forward_conditioned(
         &self,
         hidden_states: &Tensor,
         encoder_hidden_states: Option<&Tensor>,
@@ -470,30 +483,41 @@ impl QwenImageTransformer {
         timestep: &Tensor,
         height: usize,
         width: usize,
+        condition: Option<&ConditionTokens>,
         cache: Option<&mut Option<TextKvCache>>,
     ) -> Result<Tensor> {
-        let x = hidden_states.apply(&self.img_in)?;
-        let (batch, seq_img, _) = x.dims3()?;
+        let target = hidden_states.apply(&self.img_in)?;
+        let (batch, seq_img, _) = target.dims3()?;
         let seq_txt = encoder_hidden_states.map_or(Ok(0), |t| t.dim(1))?;
+        // patch_size=1: each latent pixel is its own token, no 2x2 packing
+        let vae_scale_factor = 16;
+        let layout = JointLayout::new(
+            seq_txt,
+            condition.map(|c| c.text_image_mask),
+            condition.map_or(&[][..], |c| c.shapes),
+            (height / vae_scale_factor, width / vae_scale_factor),
+        )?;
+        let prefix_len = layout.prefix_len;
         let cached = cache.as_ref().and_then(|c| c.as_ref()).cloned();
-        let extract = seq_txt > 0 && cache.is_some() && cached.is_none();
+        let extract = prefix_len > 0 && cache.is_some() && cached.is_none();
 
-        // With a cached prefix the text tokens are not recomputed at all.
+        // With a cached prefix, text and condition tokens are not recomputed at all.
         let x = match (encoder_hidden_states, &cached) {
             (Some(txt), None) => {
                 let txt = match &self.txt_in {
                     Some(txt_in) => txt_in.forward(txt)?,
                     None => txt.clone(),
                 };
-                Tensor::cat(&[txt, x], 1)?
+                let cond = condition.map(|c| c.latents.apply(&self.img_in)).transpose()?;
+                layout.assemble(&txt, cond.as_ref(), &target)?
             }
-            _ => x,
+            _ => target,
         };
         let t_emb = self.time_text_embed.forward(timestep)?;
 
-        // `causal_condition`: text tokens take a dedicated t=0 modulation row
-        // instead of the real, per-step timestep — the model was trained
-        // treating the text prefix as noise-free regardless of the image's
+        // `causal_condition`: text and condition-image tokens take a dedicated
+        // t=0 modulation row instead of the real, per-step timestep — the model
+        // was trained treating them as noise-free regardless of the target's
         // current diffusion step, while only the target-image tokens are
         // modulated by the actual noise level. The t=0 sinusoidal embedding is
         // the constant [cos(0)=1,...,1, sin(0)=0,...,0] vector (matching
@@ -502,7 +526,7 @@ impl QwenImageTransformer {
         let hidden = self.cfg.hidden_size();
         let modulation_real = self.modulation.forward(&t_emb)?; // [B, 4*hidden]
         let modulation_real_b = modulation_real.unsqueeze(1)?.broadcast_as((batch, seq_img, 4 * hidden))?;
-        let modulation = if seq_txt > 0 && cached.is_none() {
+        let modulation = if prefix_len > 0 && cached.is_none() {
             const SINUSOIDAL_HALF_DIM: usize = 128; // scheduler::timestep_embedding dim=256
             let zero_sinusoidal = Tensor::cat(
                 &[
@@ -515,42 +539,40 @@ impl QwenImageTransformer {
             let modulation_zero = self.modulation.forward(&zero_t_emb)?; // [1, 4*hidden]
             let modulation_zero_b = modulation_zero
                 .unsqueeze(1)?
-                .broadcast_as((batch, seq_txt, 4 * hidden))?
+                .broadcast_as((batch, prefix_len, 4 * hidden))?
                 .contiguous()?;
             Tensor::cat(&[&modulation_zero_b, &modulation_real_b.contiguous()?], 1)?
         } else {
             modulation_real_b.contiguous()?
         };
 
-        // RoPE over the full joint layout; a cached step keeps only the image rows.
-        let image_pad_mask: Vec<u8> = vec![0u8; seq_txt].into_iter()
-            .chain(vec![1u8; seq_img])
-            .collect();
-        let image_pad_mask = Tensor::new(image_pad_mask.as_slice(), &self.device)?
-            .to_dtype(candle_core::DType::U8)?;
-        // patch_size=1: each latent pixel is its own token, no 2x2 packing
-        let vae_scale_factor = 16;
-        let img_shapes = [(1, height / vae_scale_factor, width / vae_scale_factor)];
+        // RoPE over the full joint layout; a cached step keeps only the target rows.
+        let image_pad_mask: Vec<u8> = layout.image_pad_mask.iter().map(|&m| m as u8).collect();
+        let image_pad_mask = Tensor::new(image_pad_mask.as_slice(), &self.device)?;
         let pe = EmbedNd::new(self.cfg.hidden_size(), self.cfg.rope_theta, self.cfg.axes_dims_rope, &self.device)?
-            .forward(&img_shapes, &image_pad_mask, &self.device)?;
-        let pe = if cached.is_some() { pe.narrow(0, seq_txt, seq_img)?.contiguous()? } else { pe };
+            .forward(&layout.img_shapes, &image_pad_mask, &self.device)?;
+        let pe = if cached.is_some() { pe.narrow(0, prefix_len, seq_img)?.contiguous()? } else { pe };
 
-        // Keys cover [text ; image] in both modes: [B, seq_txt + seq_img].
+        // Keys cover the whole joint sequence in both modes; only prompt
+        // (text) positions can be padding.
         let key_valid = match encoder_hidden_states_mask {
             Some(mask) => {
-                let img_ones = Tensor::ones((mask.dim(0)?, seq_img), candle_core::DType::U8, &self.device)?;
-                Some(Tensor::cat(&[mask.to_dtype(candle_core::DType::U8)?, img_ones], 1)?)
+                let mask = mask.to_dtype(candle_core::DType::U8)?;
+                let b = mask.dim(0)?;
+                let cond_ones = Tensor::ones((b, layout.len() - seq_txt - seq_img), candle_core::DType::U8, &self.device)?;
+                let target_ones = Tensor::ones((b, seq_img), candle_core::DType::U8, &self.device)?;
+                Some(layout.assemble(&mask, Some(&cond_ones), &target_ones)?)
             }
             None => None,
         };
         let attention_mask = if cached.is_some() {
-            // Image queries see every (valid) text key and every image key.
+            // Target queries see every (valid) prefix key and every target key.
             match &key_valid {
                 Some(kv) => Some(kv.unsqueeze(1)?.unsqueeze(1)?),
                 None => None,
             }
         } else {
-            let (image_ids, _, _) = build_token_metadata(&img_shapes, seq_txt, x.dim(1)?, &self.device)?;
+            let image_ids = Tensor::new(layout.image_ids.as_slice(), &self.device)?;
             Some(build_block_causal_mask(&image_ids, key_valid.as_ref(), batch, &self.device)?)
         };
 
@@ -560,7 +582,7 @@ impl QwenImageTransformer {
             let prefix = cached.as_ref().map(|c| &c.layers[i]);
             let (h, k, v) = block.forward(&hidden_states, &modulation, &pe, attention_mask.as_ref(), prefix)?;
             if extract {
-                extracted.push((k.narrow(2, 0, seq_txt)?.contiguous()?, v.narrow(2, 0, seq_txt)?.contiguous()?));
+                extracted.push((k.narrow(2, 0, prefix_len)?.contiguous()?, v.narrow(2, 0, prefix_len)?.contiguous()?));
             }
             hidden_states = h;
         }
@@ -570,10 +592,10 @@ impl QwenImageTransformer {
             }
         }
 
-        // Final layer: AdaLayerNormContinuous, then projection; keep image tokens.
+        // Final layer: AdaLayerNormContinuous, then projection; keep target tokens.
         let output = self.final_layer.forward(&hidden_states, &t_emb)?.apply(&self.proj_out)?;
-        if seq_txt > 0 && cached.is_none() {
-            output.narrow(1, seq_txt, seq_img)
+        if cached.is_none() && prefix_len > 0 {
+            output.narrow(1, prefix_len, seq_img)
         } else {
             Ok(output)
         }

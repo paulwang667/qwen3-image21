@@ -2032,6 +2032,8 @@ dependencies = [
  "clap",
  "half",
  "image",
+ "rand",
+ "rand_distr",
  "safetensors 0.6.2",
  "serde",
  "serde_json",

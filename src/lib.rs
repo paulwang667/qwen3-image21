@@ -10,6 +10,9 @@ pub mod vae;
 pub mod pipeline;
 pub mod text_encoder;
 pub mod qwen3_vl_text;
+pub mod qwen3_vl_vision;
+pub mod condition_image;
+pub mod joint_layout;
 pub mod safetensors_util;
 
 /// Inference precision for model weights and compute.

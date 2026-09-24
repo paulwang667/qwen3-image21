@@ -1,21 +1,15 @@
 //! Text encoder for Qwen-Image-2.1.
 //!
 //! Two backends, auto-detected from `config.json`:
-//! - The **official** encoder (`text_config` key present, matching Qwen3-VL's
-//!   config shape): a real `Qwen3VLTextEncoder` (see qwen3_vl_text.rs) loaded
-//!   from the official `Qwen/Qwen-Image-2.1` `text_encoder/` weights. Its
-//!   hidden_size (4096) matches the transformer's `joint_attention_dim`
-//!   exactly, so no adapter is needed. Its tokenizer lives in a sibling
-//!   `processor/` directory (the diffusers pipeline layout splits weights and
-//!   tokenizer into separate top-level folders), not alongside the weights.
-//! - The **stand-in** encoder (plain `hidden_size` key): the real pipeline's
-//!   actual text encoder is a hybrid Qwen3-Next-style VLM (linear-attention/
-//!   Mamba2 layers mixed with regular attention, plus a non-standard int8
-//!   "rotation" quantization scheme) that candle-transformers doesn't
-//!   implement and that's out of scope to build from scratch (see CLAUDE.md).
-//!   This loads a standard dense Qwen3 causal LM instead, tiled up to the
-//!   transformer's `joint_attention_dim`, as a lower-fidelity fallback when
-//!   the official weights aren't available.
+//! - The **official** encoder (`text_config` key present): the Qwen3-VL model
+//!   from the official `Qwen/Qwen-Image-2.1` `text_encoder/` weights — the
+//!   language model (qwen3_vl_text.rs, hidden size 4096 = the transformer's
+//!   `joint_attention_dim`) plus its vision tower (qwen3_vl_vision.rs), which
+//!   reads condition images for image-conditioned generation. Its tokenizer
+//!   lives in the sibling `processor/` directory of the diffusers layout.
+//! - The **stand-in** encoder (plain `hidden_size` key): a standard dense Qwen3
+//!   causal LM whose hidden states are tiled up to `joint_attention_dim` — a
+//!   low-fidelity, text-only fallback for when the official weights don't fit.
 use std::path::{Path, PathBuf};
 
 use anyhow::{anyhow, Result};
@@ -28,8 +22,17 @@ use crate::safetensors_util::resolve_safetensors_paths;
 /// System prompt of the upstream Qwen-Image-2.1 text-to-image prompt template.
 const OFFICIAL_SYSTEM_PROMPT: &str = "Comprehend and analyze the provided prompt.";
 
+/// The official Qwen3-VL encoder: language model plus the vision tower that
+/// reads condition images.
+struct Official {
+    text: crate::qwen3_vl_text::Qwen3VLTextEncoder,
+    vision: crate::qwen3_vl_vision::Qwen3VLVisionModel,
+    image_token_id: u32,
+    spatial_merge_size: usize,
+}
+
 enum Backend {
-    Official(crate::qwen3_vl_text::Qwen3VLTextEncoder),
+    Official(Official),
     StandIn { model: candle_transformers::models::qwen3::Model, tile_factor: usize },
 }
 
@@ -69,7 +72,11 @@ impl TextEncoder {
 
         let backend = if config_json.get("text_config").is_some() {
             eprintln!("  Detected official Qwen3-VL text encoder layout");
-            let cfg: crate::qwen3_vl_text::Config = serde_json::from_value(config_json)?;
+            let cfg: crate::qwen3_vl_text::Config = serde_json::from_value(config_json.clone())?;
+            let vision_cfg: crate::qwen3_vl_vision::VisionConfig = serde_json::from_value(config_json["vision_config"].clone())?;
+            let image_token_id = config_json["image_token_id"]
+                .as_u64()
+                .ok_or_else(|| anyhow!("text encoder config.json has no image_token_id"))? as u32;
             if cfg.text_config.hidden_size != joint_attention_dim {
                 return Err(anyhow!(
                     "official text encoder hidden_size {} does not match the transformer's joint_attention_dim {}",
@@ -86,7 +93,12 @@ impl TextEncoder {
             let paths = resolve_safetensors_paths(&first_shard.to_string_lossy())?;
             eprintln!("  Loading official text encoder from {} safetensors shard(s)...", paths.len());
             let vb = unsafe { VarBuilder::from_mmaped_safetensors(&paths, DType::F32, &device)? };
-            Backend::Official(crate::qwen3_vl_text::Qwen3VLTextEncoder::new(&cfg.text_config, vb)?)
+            Backend::Official(Official {
+                text: crate::qwen3_vl_text::Qwen3VLTextEncoder::new(&cfg.text_config, vb.clone())?,
+                vision: crate::qwen3_vl_vision::Qwen3VLVisionModel::new(&vision_cfg, vb.pp("model").pp("visual"))?,
+                image_token_id,
+                spatial_merge_size: vision_cfg.spatial_merge_size,
+            })
         } else {
             eprintln!("  Detected stand-in Qwen3 text encoder layout");
             let config: candle_transformers::models::qwen3::Config = serde_json::from_value(config_json)?;
@@ -114,7 +126,7 @@ impl TextEncoder {
             Ok(tokenizer.encode(text, true).map_err(|e| anyhow!("tokenizer encode failed: {e}"))?.get_ids().to_vec())
         };
         match &mut self.backend {
-            Backend::Official(model) => {
+            Backend::Official(Official { text: model, .. }) => {
                 // Upstream wraps the prompt in this raw template (not
                 // apply_chat_template), encodes it, then drops the hidden states
                 // of the system-role prefix.
@@ -137,4 +149,47 @@ impl TextEncoder {
             }
         }
     }
+
+    /// Encodes `prompt` with condition images (upstream `QwenImage21Pipeline`'s
+    /// image-conditioned template). Returns the prompt embeddings
+    /// `[1, seq_len, 4096]` and, per returned token, whether it is an
+    /// `<|image_pad|>` slot (where the transformer substitutes the condition
+    /// image's latents). Both exclude the dropped system prefix.
+    pub fn encode_with_images(&mut self, prompt: &str, images: &[crate::condition_image::ConditionImage]) -> Result<(Tensor, Vec<bool>)> {
+        let Backend::Official(enc) = &mut self.backend else {
+            return Err(anyhow!("condition images need the official Qwen3-VL text encoder"));
+        };
+        let prompt = if prompt.is_empty() { " " } else { prompt };
+        let system = format!("<|im_start|>system\n{OFFICIAL_SYSTEM_PROMPT}<|im_end|>\n");
+        // One `<|image_pad|>` per merged vision patch, as the Qwen3-VL processor expands it.
+        let mut vision_block = String::new();
+        for (i, img) in images.iter().enumerate() {
+            if i > 0 {
+                vision_block.push(' ');
+            }
+            vision_block.push_str(&format!("<image{}><|vision_start|>{}<|vision_end|>", i + 1, "<|image_pad|>".repeat(img.num_image_tokens())));
+        }
+        let text = format!("{system}<|im_start|>user\n{vision_block}{prompt}<|im_end|>\n<|im_start|>assistant\n");
+        let tokenize = |t: &str| -> Result<Vec<u32>> {
+            Ok(self.tokenizer.encode(t, true).map_err(|e| anyhow!("tokenizer encode failed: {e}"))?.get_ids().to_vec())
+        };
+        let ids = tokenize(&text)?;
+        let drop_idx = tokenize(&system)?.len();
+
+        let features = if images.is_empty() {
+            None
+        } else {
+            let pixel_values = Tensor::cat(&images.iter().map(|i| &i.pixel_values).collect::<Vec<_>>(), 0)?;
+            let grid = Tensor::cat(&images.iter().map(|i| &i.grid_thw).collect::<Vec<_>>(), 0)?;
+            let (embeds, deepstack) = enc.vision.forward(&pixel_values, &grid)?;
+            let m = enc.spatial_merge_size;
+            let merged_grids = grid.to_vec2::<u32>()?.iter().map(|g| (g[0] as usize, g[1] as usize / m, g[2] as usize / m)).collect();
+            Some(crate::qwen3_vl_text::ImageFeatures { embeds, deepstack, merged_grids, image_token_id: enc.image_token_id })
+        };
+        let input_ids = Tensor::new(ids.as_slice(), &self.device)?.unsqueeze(0)?;
+        let hidden = enc.text.forward_with_images(&input_ids, features.as_ref())?;
+        let slots = ids[drop_idx..].iter().map(|&id| id == enc.image_token_id).collect();
+        Ok((hidden.narrow(1, drop_idx, ids.len() - drop_idx)?, slots))
+    }
+
 }

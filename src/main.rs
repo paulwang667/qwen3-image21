@@ -3,7 +3,7 @@ use candle_core::{Device, DType, IndexOp, Tensor};
 use candle_nn::VarBuilder;
 use clap::Parser;
 
-use qwen3_image21::pipeline::{PipelineConfig, TransformerType, denoise, decode_latents};
+use qwen3_image21::pipeline::{ConditionLatents, PipelineConfig, PromptEmbeds, TransformerType, denoise, decode_latents};
 use qwen3_image21::transformer::{Config as TransformerConfig, QwenImageTransformer};
 use qwen3_image21::vae::{Config as VaeConfig, VaeDecoder};
 use qwen3_image21::gguf_mapped::load_gguf_mapped;
@@ -21,13 +21,25 @@ struct Args {
     #[arg(long, default_value = "output.png")]
     output: String,
 
-    /// Image height
-    #[arg(long, default_value_t = 1024)]
-    height: usize,
+    /// Image height (default: 1024, or the condition image's aspect at
+    /// --output-resolution when --image is given)
+    #[arg(long)]
+    height: Option<usize>,
 
-    /// Image width
+    /// Image width (see --height)
+    #[arg(long)]
+    width: Option<usize>,
+
+    /// Condition image for image-conditioned generation (editing / reference);
+    /// repeat for several. Read by the Qwen3-VL vision tower and VAE-encoded
+    /// into the transformer's sequence, as upstream QwenImage21Pipeline.
+    #[arg(long = "image")]
+    images: Vec<String>,
+
+    /// Side length of the square area condition images are resized to (at their
+    /// own aspect ratio, multiples of 32); also sets the default output size.
     #[arg(long, default_value_t = 1024)]
-    width: usize,
+    output_resolution: usize,
 
     /// Number of inference steps (upstream QwenImage21Pipeline default: 40)
     #[arg(long, default_value_t = 40)]
@@ -78,9 +90,11 @@ struct Args {
     #[arg(long)]
     text_encoder_path: Option<String>,
 
-    /// Seed for random generation
-    #[arg(long, default_value_t = 42)]
-    seed: u64,
+    /// Seed for the initial noise (default: random, printed so the run can be
+    /// reproduced). Don't edit an image with the seed it was generated from:
+    /// the identical starting noise locks the edit onto the original.
+    #[arg(long)]
+    seed: Option<u64>,
 }
 
 fn load_transformer(
@@ -116,31 +130,67 @@ fn load_vae(vae_path: &str, device: &Device, dtype: DType) -> Result<VaeDecoder>
 
 
 /// Phase 1: Text encoding.
-/// Loads the text encoder, encodes the prompt, then drops the model.
-/// The returned Tensor is independent (lives on device, no model reference).
+/// Loads the text encoder, encodes the prompt (with any condition images), then
+/// drops the model. The returned tensors are independent of the model.
 fn encode_prompt(
     text_encoder_path: Option<&str>,
     prompt: &str,
     negative_prompt: Option<&str>,
+    images: &[qwen3_image21::condition_image::ConditionImage],
     device: &Device,
-) -> Result<(Tensor, Option<Tensor>)> {
+) -> Result<(PromptEmbeds, Option<PromptEmbeds>)> {
     eprintln!("[Phase 1] Text encoding");
     let embs = match text_encoder_path {
         Some(path) => {
             eprintln!("  Loading text encoder from: {}", path);
             // Dropped when this scope ends.
             let mut encoder = qwen3_image21::text_encoder::TextEncoder::load(path, 4096, device.clone())?;
-            let negative = negative_prompt.map(|p| encoder.encode(p)).transpose()?;
-            (encoder.encode(prompt)?, negative)
+            let mut encode = |p: &str| -> Result<PromptEmbeds> {
+                if images.is_empty() {
+                    Ok(PromptEmbeds { embeds: encoder.encode(p)?, image_slots: None })
+                } else {
+                    // Upstream encodes the negative prompt with the same condition images.
+                    let (embeds, slots) = encoder.encode_with_images(p, images)?;
+                    Ok(PromptEmbeds { embeds, image_slots: Some(slots) })
+                }
+            };
+            let negative = negative_prompt.map(&mut encode).transpose()?;
+            (encode(prompt)?, negative)
         }
         None => {
+            if !images.is_empty() {
+                return Err(E::msg("--image needs --text-encoder-path (the vision tower is part of the text encoder)"));
+            }
             eprintln!("  No text encoder path, using random embeddings");
-            let random = || Tensor::randn(0.0f32, 1.0f32, (1, 256, 4096), device); // f32: Metal has no F64 rand_uniform
+            let random = || -> Result<PromptEmbeds> {
+                // f32: Metal has no F64 rand_uniform
+                Ok(PromptEmbeds { embeds: Tensor::randn(0.0f32, 1.0f32, (1, 256, 4096), device)?, image_slots: None })
+            };
             (random()?, negative_prompt.map(|_| random()).transpose()?)
         }
     };
     eprintln!("  Text encoding done. Encoder released.");
     Ok(embs)
+}
+
+/// VAE-encodes the condition images into packed latents for the transformer.
+fn encode_condition_images(
+    vae_path: &str,
+    images: &[qwen3_image21::condition_image::ConditionImage],
+    device: &Device,
+) -> Result<ConditionLatents> {
+    eprintln!("[Phase 1b] Encoding {} condition image(s) with the VAE", images.len());
+    let vb = unsafe { VarBuilder::from_mmaped_safetensors(&[vae_path.to_string()], DType::F32, device)? };
+    let encoder = qwen3_image21::vae::VaeEncoder::new(&VaeConfig::default(), vb)?;
+    let mut packed = Vec::with_capacity(images.len());
+    let mut shapes = Vec::with_capacity(images.len());
+    for img in images {
+        let latents = encoder.encode(&img.vae_input)?; // [1, 64, h, w]
+        let (_, _, h, w) = latents.dims4()?;
+        packed.push(qwen3_image21::vae::pack_latents(&latents.unsqueeze(2)?)?);
+        shapes.push((h, w));
+    }
+    Ok(ConditionLatents { latents: Tensor::cat(&packed, 1)?, shapes })
 }
 
 /// Save image tensor [-1,1] to PNG file. The VAE decoder outputs 4 channels
@@ -182,8 +232,23 @@ fn main() -> Result<()> {
 
     eprintln!("Device: {:?}", device);
     eprintln!("Prompt: {}", args.prompt);
-    eprintln!("Size: {}x{}", args.width, args.height);
+    // Condition images are resized once, up front; with them the output size
+    // defaults to the last image's size (upstream derives both from the same
+    // `calculate_dimensions(output_resolution², aspect)`).
+    let condition_images = args
+        .images
+        .iter()
+        .map(|p| qwen3_image21::condition_image::load(p, args.output_resolution, &device))
+        .collect::<Result<Vec<_>>>()?;
+    let (default_w, default_h) = condition_images.last().map_or((1024, 1024), |c| (c.width, c.height));
+    let (width, height) = (args.width.unwrap_or(default_w), args.height.unwrap_or(default_h));
+    eprintln!("Size: {}x{}", width, height);
+    for (path, c) in args.images.iter().zip(&condition_images) {
+        eprintln!("Condition image: {path} -> {}x{}", c.width, c.height);
+    }
     eprintln!("Steps: {}", args.steps);
+    let seed = args.seed.unwrap_or_else(rand::random);
+    eprintln!("Seed: {seed}");
     eprintln!("Precision: {:?}", args.precision);
     eprintln!("Quantized: {}", args.quantized);
 
@@ -212,9 +277,15 @@ fn main() -> Result<()> {
         args.text_encoder_path.as_deref(),
         &args.prompt,
         args.negative_prompt.as_deref().filter(|_| do_cfg),
+        &condition_images,
         &device,
     )?;
     let guidance = negative_emb.as_ref().map(|neg| (neg, args.true_cfg_scale));
+    let condition = if condition_images.is_empty() {
+        None
+    } else {
+        Some(encode_condition_images(vae_path, &condition_images, &device)?)
+    };
     // Text encoder is dropped here; ~9.5 GB freed.
 
     // ── Phase 2+3: Diffusion ───────────────────────────────────────
@@ -228,7 +299,7 @@ fn main() -> Result<()> {
 
         // Warmup
         eprintln!("Warming up...");
-        let _ = denoise(&transformer, &prompt_emb, args.height, args.width, args.steps, guidance, !args.no_kv_cache, &pipeline_cfg)?;
+        let _ = denoise(&transformer, &prompt_emb, height, width, args.steps, guidance, condition.as_ref(), !args.no_kv_cache, seed, &pipeline_cfg)?;
 
         // Timed iterations
         let mut times = Vec::with_capacity(args.benchmark_iterations);
@@ -236,8 +307,8 @@ fn main() -> Result<()> {
         for i in 1..=args.benchmark_iterations {
             eprintln!("Benchmark iteration {}/{}", i, args.benchmark_iterations);
             let start = std::time::Instant::now();
-            let latents = denoise(&transformer, &prompt_emb, args.height, args.width, args.steps, guidance, !args.no_kv_cache, &pipeline_cfg)?;
-            let img = decode_latents(&vae_decoder, &latents, args.height, args.width, &pipeline_cfg)?;
+            let latents = denoise(&transformer, &prompt_emb, height, width, args.steps, guidance, condition.as_ref(), !args.no_kv_cache, seed, &pipeline_cfg)?;
+            let img = decode_latents(&vae_decoder, &latents, height, width, &pipeline_cfg)?;
             let elapsed = start.elapsed();
             times.push(elapsed);
             eprintln!("  Time: {:.2}s", elapsed.as_secs_f32());
@@ -267,7 +338,7 @@ fn main() -> Result<()> {
 
         eprintln!("  Denoising ({} steps)...", args.steps);
         let start = std::time::Instant::now();
-        let latents = denoise(&transformer, &prompt_emb, args.height, args.width, args.steps, guidance, !args.no_kv_cache, &pipeline_cfg)?;
+        let latents = denoise(&transformer, &prompt_emb, height, width, args.steps, guidance, condition.as_ref(), !args.no_kv_cache, seed, &pipeline_cfg)?;
         eprintln!("  Denoising done in {:.2}s", start.elapsed().as_secs_f32());
 
         // Debug hook: dump the real packed latents for offline VAE diagnostics
@@ -288,7 +359,7 @@ fn main() -> Result<()> {
 
         eprintln!("  Decoding...");
         let decode_start = std::time::Instant::now();
-        let image = decode_latents(&vae_decoder, &latents, args.height, args.width, &pipeline_cfg)?;
+        let image = decode_latents(&vae_decoder, &latents, height, width, &pipeline_cfg)?;
         eprintln!("  Decoding done in {:.2}s", decode_start.elapsed().as_secs_f32());
 
         drop(vae_decoder);
@@ -297,6 +368,6 @@ fn main() -> Result<()> {
         image
     };
 
-    save_image(&image, args.width, args.height, &args.output)?;
+    save_image(&image, width, height, &args.output)?;
     Ok(())
 }

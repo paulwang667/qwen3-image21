@@ -4,7 +4,8 @@ use candle_transformers::quantized_nn::{self as qnn, Linear};
 use candle_transformers::quantized_var_builder::VarBuilder;
 use crate::rope::{apply_rope, EmbedNd};
 use crate::scheduler::timestep_embedding;
-use crate::attention_mask::{build_token_metadata, build_block_causal_mask};
+use crate::attention_mask::build_block_causal_mask;
+use crate::joint_layout::{ConditionTokens, JointLayout};
 use crate::transformer::TextKvCache;
 
 /// Qwen-Image-2.1 config - same as non-quantized.
@@ -128,20 +129,7 @@ impl Attention {
             None => (k.clone(), v.clone()),
         };
 
-        let scale = (self.dim_head as f64).powf(-0.5);
-        eprintln!("  [Attention] q.shape={:?}, k.shape={:?}, v.shape={:?}, scale={}", q.shape(), k_all.shape(), v_all.shape(), scale);
-        let mut attn_weights = q.matmul(&k_all.transpose(2, 3)?)?.affine(scale, 0.0)?;
-        eprintln!("  [Attention] after matmul attn_weights.shape={:?}", attn_weights.shape());
-        // Apply attention mask: convert bool mask (True=attend) to additive (0/-inf)
-        if let Some(mask) = attention_mask {
-            let neg_inf = Tensor::new(f32::NEG_INFINITY, attn_weights.device())?.broadcast_as(mask.dims())?.contiguous()?;
-            let zero = Tensor::new(0.0f32, attn_weights.device())?.broadcast_as(mask.dims())?.contiguous()?;
-            let additive_mask = mask.where_cond(&zero, &neg_inf)?;
-            attn_weights = attn_weights.broadcast_add(&additive_mask)?;
-        }
-
-        let attn_weights = candle_nn::ops::softmax(&attn_weights, D::Minus1)?;
-        let attn_out = attn_weights.matmul(&v_all)?;
+        let attn_out = crate::transformer::chunked_attention(&q, &k_all, &v_all, (self.dim_head as f64).powf(-0.5), attention_mask)?;
 
         let attn_out = attn_out.transpose(1, 2)?.reshape((b, seq, self.inner_dim))?;
         Ok((attn_out.apply(&self.to_out)?, k, v))
@@ -381,7 +369,7 @@ impl QwenImageTransformerQuantized {
         height: usize,
         width: usize,
     ) -> Result<Tensor> {
-        self.forward_impl(hidden_states, text_emb, encoder_hidden_states_mask, timestep, height, width, None)
+        self.forward_conditioned(hidden_states, text_emb, encoder_hidden_states_mask, timestep, height, width, None, None)
     }
 
     /// See `QwenImageTransformer::forward_with_text_cache`.
@@ -395,10 +383,12 @@ impl QwenImageTransformerQuantized {
         width: usize,
         cache: &mut Option<TextKvCache>,
     ) -> Result<Tensor> {
-        self.forward_impl(hidden_states, Some(text_emb), encoder_hidden_states_mask, timestep, height, width, Some(cache))
+        self.forward_conditioned(hidden_states, Some(text_emb), encoder_hidden_states_mask, timestep, height, width, None, Some(cache))
     }
 
-    fn forward_impl(
+    /// See `QwenImageTransformer::forward_conditioned`.
+    #[allow(clippy::too_many_arguments)]
+    pub fn forward_conditioned(
         &self,
         hidden_states: &Tensor,
         text_emb: Option<&Tensor>,
@@ -406,59 +396,68 @@ impl QwenImageTransformerQuantized {
         timestep: &Tensor,
         height: usize,
         width: usize,
+        condition: Option<&ConditionTokens>,
         cache: Option<&mut Option<TextKvCache>>,
     ) -> Result<Tensor> {
-        let x = hidden_states.apply(&self.img_in)?;
-        let (batch, seq_img, _) = x.dims3()?;
+        let target = hidden_states.apply(&self.img_in)?;
+        let (batch, seq_img, _) = target.dims3()?;
         let seq_txt = text_emb.map_or(Ok(0), |t| t.dim(1))?;
+        // patch_size=1: each latent pixel is its own token, no 2x2 packing
+        let vae_scale_factor = 16;
+        let layout = JointLayout::new(
+            seq_txt,
+            condition.map(|c| c.text_image_mask),
+            condition.map_or(&[][..], |c| c.shapes),
+            (height / vae_scale_factor, width / vae_scale_factor),
+        )?;
+        let prefix_len = layout.prefix_len;
         let cached = cache.as_ref().and_then(|c| c.as_ref()).cloned();
-        let extract = seq_txt > 0 && cache.is_some() && cached.is_none();
+        let extract = prefix_len > 0 && cache.is_some() && cached.is_none();
 
-        // With a cached prefix the text tokens are not recomputed at all.
+        // With a cached prefix, text and condition tokens are not recomputed at all.
         let x = match (text_emb, &cached) {
             (Some(txt), None) => {
                 let txt = match &self.txt_in {
                     Some(txt_in) => txt_in.forward(txt)?,
                     None => txt.clone(),
                 };
-                Tensor::cat(&[txt, x], 1)?
+                let cond = condition.map(|c| c.latents.apply(&self.img_in)).transpose()?;
+                layout.assemble(&txt, cond.as_ref(), &target)?
             }
-            _ => x,
+            _ => target,
         };
 
         let t_emb = self.time_text_embed.forward(timestep)?;
-        let modulation_txt = if cached.is_some() { 0 } else { seq_txt };
-        let modulation = self.per_token_modulation(&t_emb, modulation_txt, seq_img, x.dtype())?;
+        let modulation_prefix = if cached.is_some() { 0 } else { prefix_len };
+        let modulation = self.per_token_modulation(&t_emb, modulation_prefix, seq_img, x.dtype())?;
 
-        // RoPE over the full joint layout; a cached step keeps only the image rows.
-        let image_pad_mask: Vec<u8> = vec![0u8; seq_txt].into_iter()
-            .chain(vec![1u8; seq_img])
-            .collect();
-        let image_pad_mask = Tensor::new(image_pad_mask.as_slice(), &self.device)?
-            .to_dtype(candle_core::DType::U8)?;
-        // patch_size=1: each latent pixel is its own token, no 2x2 packing
-        let vae_scale_factor = 16;
-        let img_shapes = [(1, height / vae_scale_factor, width / vae_scale_factor)];
+        // RoPE over the full joint layout; a cached step keeps only the target rows.
+        let image_pad_mask: Vec<u8> = layout.image_pad_mask.iter().map(|&m| m as u8).collect();
+        let image_pad_mask = Tensor::new(image_pad_mask.as_slice(), &self.device)?;
         let pe = EmbedNd::new(self.cfg.hidden_size(), self.cfg.rope_theta, self.cfg.axes_dims_rope, &self.device)?
-            .forward(&img_shapes, &image_pad_mask, &self.device)?;
-        let pe = if cached.is_some() { pe.narrow(0, seq_txt, seq_img)?.contiguous()? } else { pe };
+            .forward(&layout.img_shapes, &image_pad_mask, &self.device)?;
+        let pe = if cached.is_some() { pe.narrow(0, prefix_len, seq_img)?.contiguous()? } else { pe };
 
-        // Keys cover [text ; image] in both modes: [B, seq_txt + seq_img].
+        // Keys cover the whole joint sequence in both modes; only prompt
+        // (text) positions can be padding.
         let key_valid = match encoder_hidden_states_mask {
             Some(mask) => {
-                let img_ones = Tensor::ones((mask.dim(0)?, seq_img), candle_core::DType::U8, &self.device)?;
-                Some(Tensor::cat(&[mask.to_dtype(candle_core::DType::U8)?, img_ones], 1)?)
+                let mask = mask.to_dtype(candle_core::DType::U8)?;
+                let b = mask.dim(0)?;
+                let cond_ones = Tensor::ones((b, layout.len() - seq_txt - seq_img), candle_core::DType::U8, &self.device)?;
+                let target_ones = Tensor::ones((b, seq_img), candle_core::DType::U8, &self.device)?;
+                Some(layout.assemble(&mask, Some(&cond_ones), &target_ones)?)
             }
             None => None,
         };
         let attention_mask = if cached.is_some() {
-            // Image queries see every (valid) text key and every image key.
+            // Target queries see every (valid) prefix key and every target key.
             match &key_valid {
                 Some(kv) => Some(kv.unsqueeze(1)?.unsqueeze(1)?),
                 None => None,
             }
         } else {
-            let (image_ids, _, _) = build_token_metadata(&img_shapes, seq_txt, x.dim(1)?, &self.device)?;
+            let image_ids = Tensor::new(layout.image_ids.as_slice(), &self.device)?;
             Some(build_block_causal_mask(&image_ids, key_valid.as_ref(), batch, &self.device)?)
         };
 
@@ -468,7 +467,7 @@ impl QwenImageTransformerQuantized {
             let prefix = cached.as_ref().map(|c| &c.layers[i]);
             let (out, k, v) = block.forward(&h, &modulation, &pe, attention_mask.as_ref(), prefix)?;
             if extract {
-                extracted.push((k.narrow(2, 0, seq_txt)?.contiguous()?, v.narrow(2, 0, seq_txt)?.contiguous()?));
+                extracted.push((k.narrow(2, 0, prefix_len)?.contiguous()?, v.narrow(2, 0, prefix_len)?.contiguous()?));
             }
             h = out;
         }
@@ -479,8 +478,8 @@ impl QwenImageTransformerQuantized {
         }
 
         let output = self.final_layer.forward(&h, &t_emb)?.apply(&self.proj_out)?;
-        if seq_txt > 0 && cached.is_none() {
-            output.narrow(1, seq_txt, seq_img)
+        if cached.is_none() && prefix_len > 0 {
+            output.narrow(1, prefix_len, seq_img)
         } else {
             Ok(output)
         }

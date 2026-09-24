@@ -1,19 +1,16 @@
-//! Text-only subset of Qwen3-VL, adapted from candle-transformers' `qwen3_vl`
+//! Qwen3-VL language model, adapted from candle-transformers' `qwen3_vl`
 //! module (whose `text` submodule is private and whose public `forward()`
 //! always projects through `lm_head` and narrows to the last token — built
 //! for autoregressive generation, not for extracting per-token hidden states).
-//! This is exactly what the official Qwen-Image-2.1 `text_encoder/` weights
-//! are: a standard dense Qwen3-VL language model (no vision tower needed,
-//! since we only ever encode text prompts, never images).
+//! This is the official Qwen-Image-2.1 `text_encoder/` language model.
 //!
-//! Simplifications versus the vendored original: no vision tower / DeepStack
-//! (image-only concerns), no KV-cache (we only ever run one forward pass per
-//! prompt, never incremental decoding), and M-RoPE degenerates to plain 1D
-//! RoPE for text-only input (all three M-RoPE axes advance identically for
-//! text tokens, so this is exact for our case — but would be wrong if this
-//! module were ever used with actual image tokens).
-use std::sync::Arc;
-
+//! Versus the vendored original: no KV-cache (one forward pass per prompt), and
+//! it implements what candle's version leaves out for image inputs — the 3D
+//! multimodal RoPE positions of upstream `get_rope_index` with the checkpoint's
+//! interleaved `mrope_section`. Image features (from `qwen3_vl_vision`) replace
+//! the `<|image_pad|>` embeddings, and DeepStack features are added to those
+//! positions after the first layers. For text-only input every token's three
+//! position components are equal, so this reduces to plain 1D RoPE.
 use candle_core::{DType, Device, Module, Result, Tensor};
 use candle_nn::{embedding, linear_no_bias, rms_norm, Activation, Embedding, RmsNorm, VarBuilder};
 use serde::Deserialize;
@@ -31,6 +28,16 @@ pub struct TextConfig {
     pub max_position_embeddings: usize,
     pub rms_norm_eps: f64,
     pub rope_theta: f64,
+    #[serde(default)]
+    pub rope_scaling: Option<RopeScaling>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct RopeScaling {
+    /// Frequencies per (T, H, W) axis, interleaved as T,H,W,T,H,W,... (the
+    /// checkpoint sets `mrope_interleaved: true`).
+    #[serde(default)]
+    pub mrope_section: Vec<usize>,
 }
 
 /// Matches the real `text_encoder/config.json`'s top-level shape (a nested
@@ -40,35 +47,110 @@ pub struct Config {
     pub text_config: TextConfig,
 }
 
+/// Interleaved multimodal RoPE (upstream `Qwen3VLTextRotaryEmbedding` with
+/// `apply_interleaved_mrope`): frequency `j` takes its position from the H axis
+/// when `j % 3 == 1 && j < 3 * section[1]`, from W when `j % 3 == 2 && j < 3 *
+/// section[2]`, and from T otherwise.
 #[derive(Debug, Clone)]
-struct RotaryEmbedding {
-    cos: Tensor,
-    sin: Tensor,
+struct MultimodalRope {
+    inv_freq: Vec<f32>,
+    section: [usize; 3],
 }
 
-impl RotaryEmbedding {
-    fn new(base: f32, head_dim: usize, max_position_embeddings: usize, device: &Device, dtype: DType) -> Result<Self> {
-        let inv_freq: Vec<f32> = (0..head_dim)
-            .step_by(2)
-            .map(|i| 1f32 / base.powf(i as f32 / head_dim as f32))
-            .collect();
-        let n = inv_freq.len();
-        let inv_freq = Tensor::from_vec(inv_freq, (1, n), device)?;
-        let t = Tensor::arange(0u32, max_position_embeddings as u32, device)?
-            .to_dtype(DType::F32)?
-            .reshape((max_position_embeddings, 1))?;
-        let freqs = t.matmul(&inv_freq)?;
-        Ok(Self { cos: freqs.cos()?.to_dtype(dtype)?, sin: freqs.sin()?.to_dtype(dtype)? })
+impl MultimodalRope {
+    fn new(base: f32, head_dim: usize, section: [usize; 3]) -> Self {
+        let inv_freq = (0..head_dim).step_by(2).map(|i| 1f32 / base.powf(i as f32 / head_dim as f32)).collect();
+        Self { inv_freq, section }
     }
 
-    fn forward(&self, q: &Tensor, k: &Tensor) -> Result<(Tensor, Tensor)> {
-        let seq_len = q.dim(2)?;
-        let cos = self.cos.narrow(0, 0, seq_len)?;
-        let sin = self.sin.narrow(0, 0, seq_len)?;
-        let q = candle_nn::rotary_emb::rope(&q.contiguous()?, &cos, &sin)?;
-        let k = candle_nn::rotary_emb::rope(&k.contiguous()?, &cos, &sin)?;
-        Ok((q, k))
+    /// `cos`/`sin` of shape `[seq_len, head_dim / 2]` for per-token `(t, h, w)` positions.
+    fn cos_sin(&self, positions: &[[i64; 3]], device: &Device, dtype: DType) -> Result<(Tensor, Tensor)> {
+        let half = self.inv_freq.len();
+        let mut cos = Vec::with_capacity(positions.len() * half);
+        let mut sin = Vec::with_capacity(positions.len() * half);
+        for p in positions {
+            for (j, f) in self.inv_freq.iter().enumerate() {
+                let axis = if j % 3 == 1 && j < 3 * self.section[1] {
+                    1
+                } else if j % 3 == 2 && j < 3 * self.section[2] {
+                    2
+                } else {
+                    0
+                };
+                let angle = p[axis] as f32 * f;
+                cos.push(angle.cos());
+                sin.push(angle.sin());
+            }
+        }
+        let shape = (positions.len(), half);
+        Ok((Tensor::from_vec(cos, shape, device)?.to_dtype(dtype)?, Tensor::from_vec(sin, shape, device)?.to_dtype(dtype)?))
     }
+}
+
+/// Upstream `get_rope_index` for one unpadded sequence. Text tokens advance all
+/// three axes together; a run of image tokens with merged grid `(t, h, w)` gets
+/// `(start + t_i, start + h_i, start + w_i)`, after which positions resume at
+/// `start + max(h, w)`.
+fn mrope_positions(input_ids: &[u32], image_token_id: u32, grids: &[(usize, usize, usize)]) -> Result<Vec<[i64; 3]>> {
+    let mut out = Vec::with_capacity(input_ids.len());
+    let mut grids = grids.iter();
+    let (mut pos, mut i) = (0i64, 0usize);
+    while i < input_ids.len() {
+        if input_ids[i] != image_token_id {
+            out.push([pos; 3]);
+            pos += 1;
+            i += 1;
+            continue;
+        }
+        let Some(&(t, h, w)) = grids.next() else {
+            candle_core::bail!("more <|image_pad|> runs than image grids");
+        };
+        let run = input_ids[i..].iter().take_while(|&&id| id == image_token_id).count();
+        if run != t * h * w {
+            candle_core::bail!("image token run of {run} does not match grid {t}x{h}x{w}");
+        }
+        for ti in 0..t {
+            for hi in 0..h {
+                for wi in 0..w {
+                    out.push([pos + ti as i64, pos + hi as i64, pos + wi as i64]);
+                }
+            }
+        }
+        pos += h.max(w) as i64;
+        i += run;
+    }
+    Ok(out)
+}
+
+/// Vision-tower output for the `<|image_pad|>` tokens of one prompt, in order.
+pub struct ImageFeatures {
+    /// `[num_image_tokens, hidden_size]` merged patch embeddings.
+    pub embeds: Tensor,
+    /// One `[num_image_tokens, hidden_size]` tensor per DeepStack layer.
+    pub deepstack: Vec<Tensor>,
+    /// Merged `(t, h, w)` grid of each image (vision grid / spatial merge size).
+    pub merged_grids: Vec<(usize, usize, usize)>,
+    pub image_token_id: u32,
+}
+
+/// Returns `base` with the rows at `mask` positions replaced by (or, with
+/// `add`, increased by) consecutive rows of `rows`. `base` is `[1, L, D]`.
+fn scatter_rows(base: &Tensor, mask: &[bool], rows: &Tensor, add: bool) -> Result<Tensor> {
+    let mut pieces = Vec::new();
+    let (mut i, mut r) = (0usize, 0usize);
+    while i < mask.len() {
+        let run = mask[i..].iter().take_while(|&&m| m == mask[i]).count();
+        let seg = base.narrow(1, i, run)?;
+        pieces.push(if mask[i] {
+            let img = rows.narrow(0, r, run)?.unsqueeze(0)?.to_dtype(base.dtype())?;
+            r += run;
+            if add { (seg + img)? } else { img }
+        } else {
+            seg
+        });
+        i += run;
+    }
+    Tensor::cat(&pieces, 1)
 }
 
 struct Mlp {
@@ -105,13 +187,12 @@ struct Attention {
     num_heads: usize,
     num_kv_heads: usize,
     head_dim: usize,
-    rotary_emb: Arc<RotaryEmbedding>,
     n_kv_groups: usize,
     softmax_scale: f64,
 }
 
 impl Attention {
-    fn new(rotary_emb: Arc<RotaryEmbedding>, cfg: &TextConfig, vb: VarBuilder) -> Result<Self> {
+    fn new(cfg: &TextConfig, vb: VarBuilder) -> Result<Self> {
         Ok(Self {
             q_proj: linear_no_bias(cfg.hidden_size, cfg.num_attention_heads * cfg.head_dim, vb.pp("q_proj"))?,
             k_proj: linear_no_bias(cfg.hidden_size, cfg.num_key_value_heads * cfg.head_dim, vb.pp("k_proj"))?,
@@ -122,13 +203,12 @@ impl Attention {
             num_heads: cfg.num_attention_heads,
             num_kv_heads: cfg.num_key_value_heads,
             head_dim: cfg.head_dim,
-            rotary_emb,
             n_kv_groups: cfg.num_attention_heads / cfg.num_key_value_heads,
             softmax_scale: 1.0 / (cfg.head_dim as f64).sqrt(),
         })
     }
 
-    fn forward(&self, xs: &Tensor, causal_mask: &Tensor) -> Result<Tensor> {
+    fn forward(&self, xs: &Tensor, causal_mask: &Tensor, cos: &Tensor, sin: &Tensor) -> Result<Tensor> {
         let (b, seq, _) = xs.dims3()?;
         let q = self.q_proj.forward(xs)?.reshape((b, seq, self.num_heads, self.head_dim))?.transpose(1, 2)?;
         let k = self.k_proj.forward(xs)?.reshape((b, seq, self.num_kv_heads, self.head_dim))?.transpose(1, 2)?;
@@ -136,7 +216,8 @@ impl Attention {
 
         let q = q.apply(&self.q_norm)?;
         let k = k.apply(&self.k_norm)?;
-        let (q, k) = self.rotary_emb.forward(&q, &k)?;
+        let q = candle_nn::rotary_emb::rope(&q.contiguous()?, cos, sin)?;
+        let k = candle_nn::rotary_emb::rope(&k.contiguous()?, cos, sin)?;
 
         let q = q.contiguous()?;
         let k = candle_transformers::utils::repeat_kv(k.contiguous()?, self.n_kv_groups)?.contiguous()?;
@@ -159,19 +240,19 @@ struct DecoderLayer {
 }
 
 impl DecoderLayer {
-    fn new(rotary_emb: Arc<RotaryEmbedding>, cfg: &TextConfig, vb: VarBuilder) -> Result<Self> {
+    fn new(cfg: &TextConfig, vb: VarBuilder) -> Result<Self> {
         Ok(Self {
-            self_attn: Attention::new(rotary_emb, cfg, vb.pp("self_attn"))?,
+            self_attn: Attention::new(cfg, vb.pp("self_attn"))?,
             mlp: Mlp::new(cfg, vb.pp("mlp"))?,
             input_layernorm: rms_norm(cfg.hidden_size, cfg.rms_norm_eps, vb.pp("input_layernorm"))?,
             post_attention_layernorm: rms_norm(cfg.hidden_size, cfg.rms_norm_eps, vb.pp("post_attention_layernorm"))?,
         })
     }
 
-    fn forward(&self, xs: &Tensor, causal_mask: &Tensor) -> Result<Tensor> {
+    fn forward(&self, xs: &Tensor, causal_mask: &Tensor, cos: &Tensor, sin: &Tensor) -> Result<Tensor> {
         let residual = xs;
         let h = self.input_layernorm.forward(xs)?;
-        let h = self.self_attn.forward(&h, causal_mask)?;
+        let h = self.self_attn.forward(&h, causal_mask, cos, sin)?;
         let xs = (residual + h)?;
         let residual = &xs;
         let h = self.mlp.forward(&xs.apply(&self.post_attention_layernorm)?)?;
@@ -179,11 +260,11 @@ impl DecoderLayer {
     }
 }
 
-/// The official Qwen-Image-2.1 text encoder: a standard dense Qwen3-VL
-/// language model, text-only (no vision tower loaded or needed).
+/// The official Qwen-Image-2.1 text encoder: the Qwen3-VL language model.
 pub struct Qwen3VLTextEncoder {
     embed_tokens: Embedding,
     layers: Vec<DecoderLayer>,
+    rope: MultimodalRope,
     device: Device,
     dtype: DType,
 }
@@ -192,17 +273,20 @@ impl Qwen3VLTextEncoder {
     pub fn new(cfg: &TextConfig, vb: VarBuilder) -> Result<Self> {
         let vb_m = vb.pp("model").pp("language_model");
         let embed_tokens = embedding(cfg.vocab_size, cfg.hidden_size, vb_m.pp("embed_tokens"))?;
-        let rotary_emb = Arc::new(RotaryEmbedding::new(
-            cfg.rope_theta as f32, cfg.head_dim, cfg.max_position_embeddings, vb.device(), vb_m.dtype(),
-        )?);
+        let section = match cfg.rope_scaling.as_ref().map(|r| r.mrope_section.as_slice()) {
+            Some(&[t, h, w]) => [t, h, w],
+            // No section: every frequency reads the T axis, i.e. plain 1D RoPE.
+            _ => [cfg.head_dim / 2, 0, 0],
+        };
+        let rope = MultimodalRope::new(cfg.rope_theta as f32, cfg.head_dim, section);
         let vb_l = vb_m.pp("layers");
         let mut layers = Vec::with_capacity(cfg.num_hidden_layers);
         for i in 0..cfg.num_hidden_layers {
-            layers.push(DecoderLayer::new(rotary_emb.clone(), cfg, vb_l.pp(i))?);
+            layers.push(DecoderLayer::new(cfg, vb_l.pp(i))?);
         }
         // The final `model.language_model.norm` is deliberately not loaded:
         // Qwen-Image-2.1 conditions on the last decoder state *before* it.
-        Ok(Self { embed_tokens, layers, device: vb.device().clone(), dtype: vb.dtype() })
+        Ok(Self { embed_tokens, layers, rope, device: vb.device().clone(), dtype: vb.dtype() })
     }
 
     fn causal_mask(&self, seq_len: usize) -> Result<Tensor> {
@@ -215,11 +299,33 @@ impl Qwen3VLTextEncoder {
     /// Encodes token ids `[1, seq_len]` into the final decoder layer's output
     /// `[1, seq_len, hidden_size]`, before the model's final RMSNorm.
     pub fn forward(&self, input_ids: &Tensor) -> Result<Tensor> {
+        self.forward_with_images(input_ids, None)
+    }
+
+    /// Like [`Self::forward`], with image features for the prompt's
+    /// `<|image_pad|>` tokens (upstream `Qwen3VLModel.forward` for one
+    /// unpadded sequence).
+    pub fn forward_with_images(&self, input_ids: &Tensor, images: Option<&ImageFeatures>) -> Result<Tensor> {
         let seq_len = input_ids.dim(1)?;
-        let causal_mask = self.causal_mask(seq_len)?;
+        let ids: Vec<u32> = input_ids.flatten_all()?.to_vec1()?;
         let mut xs = self.embed_tokens.forward(input_ids)?;
-        for layer in &self.layers {
-            xs = layer.forward(&xs, &causal_mask)?;
+        let (positions, image_mask) = match images {
+            Some(img) => {
+                let mask: Vec<bool> = ids.iter().map(|&id| id == img.image_token_id).collect();
+                xs = scatter_rows(&xs, &mask, &img.embeds, false)?;
+                (mrope_positions(&ids, img.image_token_id, &img.merged_grids)?, Some(mask))
+            }
+            None => ((0..seq_len as i64).map(|p| [p; 3]).collect(), None),
+        };
+        let (cos, sin) = self.rope.cos_sin(&positions, &self.device, self.dtype)?;
+        let causal_mask = self.causal_mask(seq_len)?;
+        for (i, layer) in self.layers.iter().enumerate() {
+            xs = layer.forward(&xs, &causal_mask, &cos, &sin)?;
+            if let (Some(img), Some(mask)) = (images, &image_mask) {
+                if let Some(feat) = img.deepstack.get(i) {
+                    xs = scatter_rows(&xs, mask, feat, true)?;
+                }
+            }
         }
         Ok(xs)
     }

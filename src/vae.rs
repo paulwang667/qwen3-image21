@@ -10,6 +10,10 @@ use candle_nn::{Conv2dConfig, VarBuilder};
 #[derive(Debug, Clone)]
 pub struct Config {
     pub z_dim: usize,
+    /// Encoder base width (`base_dim`); the decoder uses `decoder_base_dim`.
+    pub encoder_base_dim: usize,
+    /// Encoder input channels: RGBA, matching the decoder's `out_channels`.
+    pub in_channels: usize,
     pub decoder_base_dim: usize,
     pub dim_mult: Vec<usize>,
     pub num_res_blocks: usize,
@@ -25,6 +29,8 @@ impl Default for Config {
     fn default() -> Self {
         Self {
             z_dim: 64,
+            encoder_base_dim: 96,
+            in_channels: 4,
             decoder_base_dim: 144,
             dim_mult: vec![1, 2, 4, 8, 8],
             num_res_blocks: 2,
@@ -397,6 +403,137 @@ impl VaeDecoder {
     }
 }
 
+/// `QwenImage21AvgDown3D` for a single frame: space-to-depth by `factor_s`,
+/// then channels averaged in groups down to `out_channels`. With `factor_t=2`
+/// the upstream module front-pads the one-frame input with a zero frame, so the
+/// zero frame fills temporal slot 0 and is averaged in too — replicated here,
+/// since skipping it would change every temporally-downsampling block's shortcut.
+fn avg_down3d(x: &Tensor, out_channels: usize, factor_t: usize, factor_s: usize) -> Result<Tensor> {
+    let (b, c, h, w) = x.dims4()?;
+    let (ho, wo, fs2) = (h / factor_s, w / factor_s, factor_s * factor_s);
+    // [B, C, fs, fs, H', W'] -> channel order (c, sh, sw), as upstream's permute.
+    let s2d = x
+        .reshape((b, c, ho, factor_s, wo, factor_s))?
+        .permute((0, 1, 3, 5, 2, 4))?
+        .contiguous()?
+        .reshape((b, c, 1, fs2, ho, wo))?;
+    let y = match factor_t {
+        1 => s2d,
+        2 => Tensor::cat(&[&s2d.zeros_like()?, &s2d], 2)?,
+        _ => candle_core::bail!("avg_down3d: unsupported factor_t {factor_t}"),
+    };
+    let group = c * factor_t * fs2 / out_channels;
+    y.reshape((b, out_channels, group, ho, wo))?.mean(2)
+}
+
+/// Encoder down-block (`QwenImage21ResidualDownBlock`, `is_residual=true`):
+/// resnets, then an optional downsampler (right/bottom zero-pad by 1 + stride-2
+/// 3x3 conv), plus the parallel `avg_down3d` shortcut of the block input. The
+/// downsampler's `time_conv` only runs from the second frame on, so it is
+/// unused for single images.
+#[derive(Debug, Clone)]
+struct DownBlock {
+    resnets: Vec<ResidualBlock>,
+    downsample: Option<candle_nn::Conv2d>,
+    out_dim: usize,
+    factor_t: usize,
+    factor_s: usize,
+}
+
+impl DownBlock {
+    fn new(in_dim: usize, out_dim: usize, num_res_blocks: usize, down_flag: bool, temporal: bool, vb: VarBuilder) -> Result<Self> {
+        let mut resnets = Vec::with_capacity(num_res_blocks);
+        let mut dim = in_dim;
+        for j in 0..num_res_blocks {
+            resnets.push(ResidualBlock::new(dim, out_dim, false, vb.pp(format!("resnets.{j}")))?);
+            dim = out_dim;
+        }
+        let downsample = if down_flag {
+            let cfg = Conv2dConfig { stride: 2, ..Default::default() };
+            Some(candle_nn::conv2d(out_dim, out_dim, 3, cfg, vb.pp("downsampler.resample.1"))?)
+        } else {
+            None
+        };
+        Ok(Self {
+            resnets,
+            downsample,
+            out_dim,
+            factor_t: if temporal { 2 } else { 1 },
+            factor_s: if down_flag { 2 } else { 1 },
+        })
+    }
+
+    fn forward(&self, x: &Tensor) -> Result<Tensor> {
+        let mut y = x.clone();
+        for resnet in &self.resnets {
+            y = resnet.forward(&y)?;
+        }
+        if let Some(conv) = &self.downsample {
+            y = y.pad_with_zeros(D::Minus1, 0, 1)?.pad_with_zeros(D::Minus2, 0, 1)?.apply(conv)?;
+        }
+        y + avg_down3d(x, self.out_dim, self.factor_t, self.factor_s)?
+    }
+}
+
+/// Encoder of `AutoencoderKLQwenImage21` (official diffusers layout only), for
+/// turning condition images into latents.
+#[derive(Debug, Clone)]
+pub struct VaeEncoder {
+    conv_in: candle_nn::Conv2d,
+    down_blocks: Vec<DownBlock>,
+    mid_block: MidBlock,
+    norm_out: RmsNormChannelFirst,
+    conv_out: candle_nn::Conv2d,
+    quant_conv: candle_nn::Conv2d,
+    z_dim: usize,
+    latents_mean: Vec<f32>,
+    latents_std: Vec<f32>,
+}
+
+impl VaeEncoder {
+    pub fn new(cfg: &Config, vb: VarBuilder) -> Result<Self> {
+        let mut dims = vec![cfg.encoder_base_dim];
+        dims.extend(cfg.dim_mult.iter().map(|&m| cfg.encoder_base_dim * m));
+        let n = cfg.dim_mult.len();
+        let enc = vb.pp("encoder");
+        let conv_in = candle_nn::conv2d(cfg.in_channels, dims[0], 3, Conv2dConfig { padding: 1, ..Default::default() }, enc.pp("conv_in"))?;
+        let mut down_blocks = Vec::with_capacity(n);
+        for i in 0..n {
+            let down_flag = i != n - 1;
+            let temporal = down_flag && cfg.temperal_downsample.get(i).copied().unwrap_or(false);
+            down_blocks.push(DownBlock::new(dims[i], dims[i + 1], cfg.num_res_blocks, down_flag, temporal, enc.pp(format!("down_blocks.{i}")))?);
+        }
+        let out_dim = dims[n];
+        let mid_block = MidBlock::new(out_dim, false, enc.pp("mid_block"))?;
+        let norm_out = RmsNormChannelFirst::new(out_dim, 3, enc.pp("norm_out"))?;
+        let conv_out = candle_nn::conv2d(out_dim, 2 * cfg.z_dim, 3, Conv2dConfig { padding: 1, ..Default::default() }, enc.pp("conv_out"))?;
+        let quant_conv = candle_nn::conv2d(2 * cfg.z_dim, 2 * cfg.z_dim, 1, Default::default(), vb.pp("quant_conv"))?;
+        Ok(Self {
+            conv_in, down_blocks, mid_block, norm_out, conv_out, quant_conv,
+            z_dim: cfg.z_dim,
+            latents_mean: cfg.latents_mean.clone(),
+            latents_std: cfg.latents_std.clone(),
+        })
+    }
+
+    /// Encode an RGBA image `[B, 4, H, W]` in `[-1, 1]` into normalized latents
+    /// `[B, z_dim, H/16, W/16]`: the posterior mean (upstream's
+    /// `sample_mode="argmax"`), then `(x - latents_mean) / latents_std`.
+    pub fn encode(&self, image: &Tensor) -> Result<Tensor> {
+        let mut x = image.apply(&self.conv_in)?;
+        for block in &self.down_blocks {
+            x = block.forward(&x)?;
+        }
+        x = self.mid_block.forward(&x)?;
+        x = self.norm_out.forward(&x)?.silu()?.apply(&self.conv_out)?.apply(&self.quant_conv)?;
+        let mean = x.narrow(1, 0, self.z_dim)?;
+        let (device, dt) = (mean.device(), mean.dtype());
+        let m = Tensor::new(self.latents_mean.as_slice(), device)?.to_dtype(dt)?.reshape((1, self.z_dim, 1, 1))?;
+        let s = Tensor::new(self.latents_std.as_slice(), device)?.to_dtype(dt)?.reshape((1, self.z_dim, 1, 1))?;
+        mean.broadcast_sub(&m)?.broadcast_div(&s)
+    }
+}
+
 /// Unpack a transformer token sequence `[B, H*W, C]` back into `[B, C, 1, H, W]`.
 /// Qwen-Image-2.1's transformer uses `patch_size=1` (each latent pixel is its own
 /// token, `in_channels`/`out_channels` == the VAE's `z_dim` directly) — unlike
@@ -453,6 +590,8 @@ mod tests {
         let device = Device::Cpu;
         let cfg = Config {
             z_dim: 8,
+            encoder_base_dim: 4,
+            in_channels: 4,
             decoder_base_dim: 4,
             dim_mult: vec![1, 2, 4, 8, 8],
             num_res_blocks: 1,
